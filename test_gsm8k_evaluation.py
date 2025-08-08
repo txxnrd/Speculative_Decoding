@@ -49,8 +49,14 @@ def run_spec(decoder, tokenizer, questions, max_new_tokens, logger, tag):
     logger.info(f"Running {tag} generation…")
     stats = []
     for i, q in enumerate(questions):
-        input_ids = tokenizer.encode(q, return_tensors="pt").to("cuda")
-        out = decoder.generate(input_ids=input_ids, max_new_tokens=max_new_tokens)
+        inputs = tokenizer(q, return_tensors="pt", truncation=True, max_length=1024)
+        input_ids = inputs.input_ids.to("cuda")
+        attention_mask = inputs.attention_mask.to("cuda")
+        out = decoder.generate(
+            input_ids=input_ids, 
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens
+        )
         s = out["stats"]
         logger.info(
             f"  {tag} {i+1}: {s['total_tokens']} tokens in {s['total_time']:.2f}s "
@@ -140,11 +146,11 @@ def main():
     # Model configuration
     cfg = Config(
         draft_model=ModelConfig(
-            model_path="/hdd1/taeyun/Llama-3.1-8B-Instruct",
+            model_path="/raid/junha/models/Llama-3.1-8B-Instruct",
             device="auto",
         ),
         target_model=ModelConfig(
-            model_path="/hdd1/taeyun/Llama-3.1-70B-Instruct",
+            model_path="/raid/junha/models/Llama-3.1-70B-Instruct",
             device="auto",
         ),
         sampling=SamplingConfig(
@@ -155,8 +161,8 @@ def main():
     loader = ModelLoader(logger=logger)
     draft, target, tok = loader.load_draft_and_target_models(cfg.draft_model, cfg.target_model)
     
-    # Baseline (KV cache enabled by default in HF)
-    base_stats = run_baseline(target, tok, questions, args.max_new, logger)
+    # # Baseline (KV cache enabled by default in HF)
+    # base_stats = run_baseline(target, tok, questions, args.max_new, logger)
 
     # Our implementation - Basic speculative (with KV cache)
     spec_cfg_basic = SpeculativeDecodingConfig(num_assistant_tokens=5, use_cache=True, verbose=False)

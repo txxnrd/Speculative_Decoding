@@ -348,6 +348,10 @@ class OptimizedSpeculativeDecoderV2:
         """Generate text using optimized speculative decoding."""
         self._log(f"Starting generation with max_new_tokens={max_new_tokens}")
         
+        # Ensure attention_mask is not None, create if it is
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+
         batch_size = input_ids.shape[0]
         device = input_ids.device
         
