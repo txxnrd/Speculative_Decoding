@@ -149,13 +149,13 @@ def main():
     loader = ModelLoader(logger=logger)
     draft, target, tok = loader.load_draft_and_target_models(cfg.draft_model, cfg.target_model)
     
-    # Baseline (KV cache enabled by default in HF)
-    base_stats = run_baseline(target, tok, questions, args.max_new, logger)
+    # # Baseline (KV cache enabled by default in HF)
+    # base_stats = run_baseline(target, tok, questions, args.max_new, logger)
 
-    # Our implementation - Basic speculative (with KV cache)
-    spec_cfg_basic = SpeculativeDecodingConfig(num_assistant_tokens=5, use_cache=True, verbose=False)
-    dec_basic = OptimizedSpeculativeDecoderV2(draft, target, tok, cfg, spec_cfg_basic, logger)
-    basic_stats = run_spec(dec_basic, tok, questions, args.max_new, logger, "Our Basic Speculative (KV)")
+    # # Our implementation - Basic speculative (with KV cache)
+    # spec_cfg_basic = SpeculativeDecodingConfig(num_assistant_tokens=5, use_cache=True, verbose=False)
+    # dec_basic = OptimizedSpeculativeDecoderV2(draft, target, tok, cfg, spec_cfg_basic, logger)
+    # basic_stats = run_spec(dec_basic, tok, questions, args.max_new, logger, "Our Basic Speculative (KV)")
 
     # Our implementation - Affine speculative (with KV cache)
     spec_cfg_aff = SpeculativeDecodingConfig(
