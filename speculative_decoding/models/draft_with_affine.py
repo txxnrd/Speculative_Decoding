@@ -25,7 +25,7 @@ class DraftModelWithAffine(PreTrainedModel):
     def __init__(self, base_model: PreTrainedModel, affine_verifier, threshold: float = 0.5):
         # IMPORTANT: initialize parent before assigning Module attributes
         super().__init__(base_model.config)
-        self.base_model = base_model
+        self.wrapped_model = base_model
         self.affine_verifier = affine_verifier
         self.threshold = threshold
 
@@ -47,17 +47,35 @@ class DraftModelWithAffine(PreTrainedModel):
                 setattr(self.generation_config, "assistant_confidence_threshold", 0.3)
         # tie parameters etc. not needed because we delegate
 
+    # Convenience properties
+    @property
+    def device(self):  # type: ignore
+        return getattr(self.wrapped_model, "device", super().device)
+
+    @property
+    def dtype(self):  # type: ignore
+        # try param dtype of wrapped model
+        try:
+            return next(self.wrapped_model.parameters()).dtype
+        except Exception:
+            return super().dtype
+
     # ------------------------------------------------------------------
     # Delegation helpers
     # ------------------------------------------------------------------
     def forward(self, *args, **kwargs):  # noqa
-        return self.base_model(*args, **kwargs)
+        return self.wrapped_model(*args, **kwargs)
 
     def __getattr__(self, name):
-        # Delegate everything else to the underlying model
-        if name == "base_model":
+        # Avoid recursion for our own and base attributes
+        if name in {"wrapped_model", "affine_verifier", "threshold", "generation_config", "config"}:
             return super().__getattribute__(name)
-        return getattr(self.base_model, name)
+        # Safely delegate to the wrapped model if attribute exists there
+        wrapped = super().__getattribute__("wrapped_model")
+        if hasattr(wrapped, name):
+            return getattr(wrapped, name)
+        # Fallback to default behavior
+        return super().__getattribute__(name)
 
     # ------------------------------------------------------------------
     # Overridden generate that applies filtering
@@ -68,7 +86,7 @@ class DraftModelWithAffine(PreTrainedModel):
         kwargs["output_hidden_states"] = True
         kwargs["return_dict_in_generate"] = True
 
-        out = self.base_model.generate(*args, **kwargs)
+        out = self.wrapped_model.generate(*args, **kwargs)
 
         # out.sequences: (B, prompt + K)
         # Determine draft portion length K from max_new_tokens argument
