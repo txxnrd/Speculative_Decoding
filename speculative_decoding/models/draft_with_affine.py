@@ -10,6 +10,10 @@ This lets us plug our affine mapping strategy into HF's highly-optimized
 from typing import Optional
 import torch
 from transformers import PreTrainedModel
+try:
+    from transformers import GenerationConfig
+except Exception:  # older versions
+    GenerationConfig = None  # type: ignore
 
 # The HF generate with return_dict_in_generate=True yields a ModelOutput subclass
 # that at least has `.sequences`, `.scores`, and (if requested) `.hidden_states`.
@@ -24,6 +28,23 @@ class DraftModelWithAffine(PreTrainedModel):
         self.base_model = base_model
         self.affine_verifier = affine_verifier
         self.threshold = threshold
+
+        # Ensure generation_config exists and carries assistant fields expected by HF
+        gen_cfg = getattr(base_model, "generation_config", None)
+        if gen_cfg is None and GenerationConfig is not None:
+            # Create from model config if possible
+            try:
+                gen_cfg = GenerationConfig.from_model_config(base_model.config)
+            except Exception:
+                gen_cfg = GenerationConfig()
+        self.generation_config = gen_cfg if gen_cfg is not None else getattr(self, "generation_config", None)
+        
+        # Inject defaults if missing
+        if self.generation_config is not None:
+            if not hasattr(self.generation_config, "num_assistant_tokens"):
+                setattr(self.generation_config, "num_assistant_tokens", 5)
+            if not hasattr(self.generation_config, "assistant_confidence_threshold"):
+                setattr(self.generation_config, "assistant_confidence_threshold", 0.3)
         # tie parameters etc. not needed because we delegate
 
     # ------------------------------------------------------------------

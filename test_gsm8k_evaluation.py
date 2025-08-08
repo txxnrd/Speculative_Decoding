@@ -26,10 +26,12 @@ def run_baseline(target_model, tokenizer, questions, max_new_tokens, logger):
     stats = []
     for i, q in enumerate(questions):
         input_ids = tokenizer.encode(q, return_tensors="pt").to(target_model.device)
+        attention_mask = torch.ones_like(input_ids)
         start = time.time()
         with torch.no_grad():
             _ = target_model.generate(
                 input_ids=input_ids,
+                attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
                 do_sample=True,
                 temperature=0.7,
@@ -66,11 +68,13 @@ def run_hf_speculative(draft_model, target_model, tokenizer, questions, max_new_
     stats = []
     for i, q in enumerate(questions):
         input_ids = tokenizer.encode(q, return_tensors="pt").to(target_model.device)
+        attention_mask = torch.ones_like(input_ids)
         
         start_time = time.time()
         with torch.no_grad():
             outputs = target_model.generate(
                 input_ids=input_ids,
+                attention_mask=attention_mask,
                 assistant_model=draft_model,
                 max_new_tokens=max_new_tokens,
                 do_sample=True,
@@ -99,10 +103,12 @@ def run_hf_affine(draft_model, target_model, verifier, tokenizer, questions, max
     stats = []
     for i, q in enumerate(questions):
         input_ids = tokenizer.encode(q, return_tensors="pt").to(target_model.device)
+        attention_mask = torch.ones_like(input_ids)
         start = time.time()
         with torch.no_grad():
             out = target_model.generate(
                 input_ids=input_ids,
+                attention_mask=attention_mask,
                 assistant_model=wrapped_draft,
                 max_new_tokens=max_new_tokens,
                 do_sample=True,
@@ -134,11 +140,11 @@ def main():
     # Model configuration
     cfg = Config(
         draft_model=ModelConfig(
-            model_path="/hdd1/taeyun/Llama-3.1-8B-Instruct",
+            model_path="/raid/junha/models/Llama-3.1-8B-Instruct",
             device="auto",
         ),
         target_model=ModelConfig(
-            model_path="/hdd1/taeyun/Llama-3.1-70B-Instruct",
+            model_path="/raid/junha/models/Llama-3.1-70B-Instruct",
             device="auto",
         ),
         sampling=SamplingConfig(
@@ -149,28 +155,28 @@ def main():
     loader = ModelLoader(logger=logger)
     draft, target, tok = loader.load_draft_and_target_models(cfg.draft_model, cfg.target_model)
     
-    # # Baseline (KV cache enabled by default in HF)
-    # base_stats = run_baseline(target, tok, questions, args.max_new, logger)
+    # Baseline (KV cache enabled by default in HF)
+    base_stats = run_baseline(target, tok, questions, args.max_new, logger)
 
-    # # Our implementation - Basic speculative (with KV cache)
-    # spec_cfg_basic = SpeculativeDecodingConfig(num_assistant_tokens=5, use_cache=True, verbose=False)
-    # dec_basic = OptimizedSpeculativeDecoderV2(draft, target, tok, cfg, spec_cfg_basic, logger)
-    # basic_stats = run_spec(dec_basic, tok, questions, args.max_new, logger, "Our Basic Speculative (KV)")
+    # Our implementation - Basic speculative (with KV cache)
+    spec_cfg_basic = SpeculativeDecodingConfig(num_assistant_tokens=5, use_cache=True, verbose=False)
+    dec_basic = OptimizedSpeculativeDecoderV2(draft, target, tok, cfg, spec_cfg_basic, logger)
+    basic_stats = run_spec(dec_basic, tok, questions, args.max_new, logger, "Our Basic Speculative (KV)")
 
-    # # Our implementation - Affine speculative (with KV cache)
-    # spec_cfg_aff = SpeculativeDecodingConfig(
-    #     num_assistant_tokens=5,
-    #     affine_verification=True,
-    #     affine_model_path=args.affine_model,
-    #     affine_accept_threshold=0.5,
-    #     use_cache=True,
-    #     verbose=False,
-    # )
-    # dec_aff = OptimizedSpeculativeDecoderV2(draft, target, tok, cfg, spec_cfg_aff, logger)
-    # affine_stats = run_spec(dec_aff, tok, questions, args.max_new, logger, "Our Affine Speculative (KV)")
+    # Our implementation - Affine speculative (with KV cache)
+    spec_cfg_aff = SpeculativeDecodingConfig(
+        num_assistant_tokens=5,
+        affine_verification=True,
+        affine_model_path=args.affine_model,
+        affine_accept_threshold=0.5,
+        use_cache=True,
+        verbose=False,
+    )
+    dec_aff = OptimizedSpeculativeDecoderV2(draft, target, tok, cfg, spec_cfg_aff, logger)
+    affine_stats = run_spec(dec_aff, tok, questions, args.max_new, logger, "Our Affine Speculative (KV)")
 
-    # # HuggingFace native speculative decoding
-    # hf_spec_stats = run_hf_speculative(draft, target, tok, questions, args.max_new, logger)
+    # HuggingFace native speculative decoding
+    hf_spec_stats = run_hf_speculative(draft, target, tok, questions, args.max_new, logger)
 
     # Load verifier for HF+Affine
     from speculative_decoding.algorithms.affine_alignment import AffineVerifier
