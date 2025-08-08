@@ -67,15 +67,26 @@ class DraftModelWithAffine(PreTrainedModel):
         return self.wrapped_model(*args, **kwargs)
 
     def __getattr__(self, name):
+        # Special handling for device and dtype to use properties
+        if name == "device":
+            return self.device
+        if name == "dtype":
+            return self.dtype
+            
         # Avoid recursion for our own and base attributes
         if name in {"wrapped_model", "affine_verifier", "threshold", "generation_config", "config"}:
-            return super().__getattribute__(name)
+            raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
+            
         # Safely delegate to the wrapped model if attribute exists there
-        wrapped = super().__getattribute__("wrapped_model")
+        try:
+            wrapped = object.__getattribute__(self, "wrapped_model")
+        except AttributeError:
+            raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
+            
         if hasattr(wrapped, name):
             return getattr(wrapped, name)
-        # Fallback to default behavior
-        return super().__getattribute__(name)
+        # Fallback to AttributeError
+        raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
 
     # ------------------------------------------------------------------
     # Overridden generate that applies filtering
