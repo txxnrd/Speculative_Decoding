@@ -15,11 +15,11 @@ def main():
     # Configuration
     config = Config(
         model=Config.ModelConfig(
-            model_path="/raid/junha/models/Llama-3.1-8B-Instruct",
+            model_path="/hdd1/taeyun/Llama-3.1-8B-Instruct",
             device="cuda"
         ),
         target_model=Config.ModelConfig(
-            model_path="/raid/junha/models/Llama-3.1-70B-Instruct", 
+            model_path="/hdd1/taeyun/Llama-3.1-70B-Instruct", 
             device="auto"
         ),
         sampling=Config.SamplingConfig(

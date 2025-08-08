@@ -15,11 +15,11 @@ def test_affine_simple():
     # Create simple test configuration
     config = Config(
         draft_model=ModelConfig(
-            model_path="/raid/junha/models/Llama-3.1-8B-Instruct",
+            model_path="/hdd1/taeyun/Llama-3.1-8B-Instruct",
             device="auto"
         ),
         target_model=ModelConfig(
-            model_path="/raid/junha/models/Llama-3.1-8B-Instruct",  # Use same model for simplicity
+            model_path="/hdd1/taeyun/Llama-3.1-8B-Instruct",  # Use same model for simplicity
             device="auto"
         ),
         sampling=SamplingConfig(

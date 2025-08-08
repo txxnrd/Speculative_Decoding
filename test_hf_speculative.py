@@ -71,8 +71,8 @@ def main():
     questions = [ds[i]["question"].strip() + " Answer:" for i in range(min(args.num_samples, len(ds)))]
 
     cfg = Config(
-        draft_model=ModelConfig(model_path="/raid/junha/models/Llama-3.1-8B-Instruct", device="auto"),
-        target_model=ModelConfig(model_path="/raid/junha/models/Llama-3.1-70B-Instruct", device="auto"),
+        draft_model=ModelConfig(model_path="/hdd1/taeyun/Llama-3.1-8B-Instruct", device="auto"),
+        target_model=ModelConfig(model_path="/hdd1/taeyun/Llama-3.1-70B-Instruct", device="auto"),
         sampling=SamplingConfig(temperature=0.7, top_k=50, top_p=0.9, do_sample=True),
     )
 
