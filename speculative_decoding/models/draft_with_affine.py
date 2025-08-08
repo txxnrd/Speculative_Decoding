@@ -28,10 +28,6 @@ class DraftModelWithAffine(PreTrainedModel):
         self.wrapped_model = base_model
         self.affine_verifier = affine_verifier
         self.threshold = threshold
-        
-        # Copy important attributes that HF expects
-        self.device = base_model.device
-        self.dtype = next(base_model.parameters()).dtype if base_model.parameters() else torch.float32
 
         # Ensure generation_config exists and carries assistant fields expected by HF
         gen_cfg = getattr(base_model, "generation_config", None)
@@ -50,6 +46,25 @@ class DraftModelWithAffine(PreTrainedModel):
             if not hasattr(self.generation_config, "assistant_confidence_threshold"):
                 setattr(self.generation_config, "assistant_confidence_threshold", 0.3)
 
+    # Read-only properties delegating to wrapped model
+    @property
+    def device(self):  # type: ignore
+        try:
+            return self.wrapped_model.device
+        except Exception:
+            # derive from parameters if needed
+            try:
+                return next(self.wrapped_model.parameters()).device
+            except Exception:
+                return torch.device("cpu")
+
+    @property
+    def dtype(self):  # type: ignore
+        try:
+            return next(self.wrapped_model.parameters()).dtype
+        except Exception:
+            return torch.float32
+
     # ------------------------------------------------------------------
     # Delegation helpers
     # ------------------------------------------------------------------
@@ -57,7 +72,7 @@ class DraftModelWithAffine(PreTrainedModel):
         return self.wrapped_model(*args, **kwargs)
 
     def __getattr__(self, name):
-        # For any missing attribute, try to get it from the wrapped model
+        # Delegate missing attrs to the wrapped model
         try:
             return getattr(self.wrapped_model, name)
         except AttributeError:
