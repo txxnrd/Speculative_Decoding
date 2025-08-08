@@ -155,28 +155,28 @@ def main():
     loader = ModelLoader(logger=logger)
     draft, target, tok = loader.load_draft_and_target_models(cfg.draft_model, cfg.target_model)
     
-    # Baseline (KV cache enabled by default in HF)
-    base_stats = run_baseline(target, tok, questions, args.max_new, logger)
+    # # Baseline (KV cache enabled by default in HF)
+    # base_stats = run_baseline(target, tok, questions, args.max_new, logger)
 
-    # Our implementation - Basic speculative (with KV cache)
-    spec_cfg_basic = SpeculativeDecodingConfig(num_assistant_tokens=5, use_cache=True, verbose=False)
-    dec_basic = OptimizedSpeculativeDecoderV2(draft, target, tok, cfg, spec_cfg_basic, logger)
-    basic_stats = run_spec(dec_basic, tok, questions, args.max_new, logger, "Our Basic Speculative (KV)")
+    # # Our implementation - Basic speculative (with KV cache)
+    # spec_cfg_basic = SpeculativeDecodingConfig(num_assistant_tokens=5, use_cache=True, verbose=False)
+    # dec_basic = OptimizedSpeculativeDecoderV2(draft, target, tok, cfg, spec_cfg_basic, logger)
+    # basic_stats = run_spec(dec_basic, tok, questions, args.max_new, logger, "Our Basic Speculative (KV)")
 
-    # Our implementation - Affine speculative (with KV cache)
-    spec_cfg_aff = SpeculativeDecodingConfig(
-        num_assistant_tokens=5,
-        affine_verification=True,
-        affine_model_path=args.affine_model,
-        affine_accept_threshold=0.5,
-        use_cache=True,
-        verbose=False,
-    )
-    dec_aff = OptimizedSpeculativeDecoderV2(draft, target, tok, cfg, spec_cfg_aff, logger)
-    affine_stats = run_spec(dec_aff, tok, questions, args.max_new, logger, "Our Affine Speculative (KV)")
+    # # Our implementation - Affine speculative (with KV cache)
+    # spec_cfg_aff = SpeculativeDecodingConfig(
+    #     num_assistant_tokens=5,
+    #     affine_verification=True,
+    #     affine_model_path=args.affine_model,
+    #     affine_accept_threshold=0.5,
+    #     use_cache=True,
+    #     verbose=False,
+    # )
+    # dec_aff = OptimizedSpeculativeDecoderV2(draft, target, tok, cfg, spec_cfg_aff, logger)
+    # affine_stats = run_spec(dec_aff, tok, questions, args.max_new, logger, "Our Affine Speculative (KV)")
 
-    # HuggingFace native speculative decoding
-    hf_spec_stats = run_hf_speculative(draft, target, tok, questions, args.max_new, logger)
+    # # HuggingFace native speculative decoding
+    # hf_spec_stats = run_hf_speculative(draft, target, tok, questions, args.max_new, logger)
 
     # Load verifier for HF+Affine
     from speculative_decoding.algorithms.affine_alignment import AffineVerifier
