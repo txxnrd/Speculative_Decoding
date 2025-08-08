@@ -28,6 +28,10 @@ class DraftModelWithAffine(PreTrainedModel):
         self.wrapped_model = base_model
         self.affine_verifier = affine_verifier
         self.threshold = threshold
+        
+        # Copy important attributes that HF expects
+        self.device = base_model.device
+        self.dtype = next(base_model.parameters()).dtype if base_model.parameters() else torch.float32
 
         # Ensure generation_config exists and carries assistant fields expected by HF
         gen_cfg = getattr(base_model, "generation_config", None)
@@ -45,20 +49,6 @@ class DraftModelWithAffine(PreTrainedModel):
                 setattr(self.generation_config, "num_assistant_tokens", 5)
             if not hasattr(self.generation_config, "assistant_confidence_threshold"):
                 setattr(self.generation_config, "assistant_confidence_threshold", 0.3)
-        # tie parameters etc. not needed because we delegate
-
-    # Convenience properties
-    @property
-    def device(self):  # type: ignore
-        return getattr(self.wrapped_model, "device", super().device)
-
-    @property
-    def dtype(self):  # type: ignore
-        # try param dtype of wrapped model
-        try:
-            return next(self.wrapped_model.parameters()).dtype
-        except Exception:
-            return super().dtype
 
     # ------------------------------------------------------------------
     # Delegation helpers
@@ -67,26 +57,11 @@ class DraftModelWithAffine(PreTrainedModel):
         return self.wrapped_model(*args, **kwargs)
 
     def __getattr__(self, name):
-        # Special handling for device and dtype to use properties
-        if name == "device":
-            return self.device
-        if name == "dtype":
-            return self.dtype
-            
-        # Avoid recursion for our own and base attributes
-        if name in {"wrapped_model", "affine_verifier", "threshold", "generation_config", "config"}:
-            raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
-            
-        # Safely delegate to the wrapped model if attribute exists there
+        # For any missing attribute, try to get it from the wrapped model
         try:
-            wrapped = object.__getattribute__(self, "wrapped_model")
+            return getattr(self.wrapped_model, name)
         except AttributeError:
             raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
-            
-        if hasattr(wrapped, name):
-            return getattr(wrapped, name)
-        # Fallback to AttributeError
-        raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{name}'")
 
     # ------------------------------------------------------------------
     # Overridden generate that applies filtering
