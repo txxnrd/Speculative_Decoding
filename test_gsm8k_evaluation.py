@@ -140,11 +140,11 @@ def main():
     # Model configuration
     cfg = Config(
         draft_model=ModelConfig(
-            model_path="/raid/junha/models/Llama-3.1-8B-Instruct",
+            model_path="/hdd1/taeyun/Llama-3.1-8B-Instruct",
             device="auto",
         ),
         target_model=ModelConfig(
-            model_path="/raid/junha/models/Llama-3.1-70B-Instruct",
+            model_path="/hdd1/taeyun/Llama-3.1-70B-Instruct",
             device="auto",
         ),
         sampling=SamplingConfig(
