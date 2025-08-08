@@ -108,75 +108,48 @@ class OptimizedSpeculativeDecoderV2:
         past_key_values: Optional[Tuple] = None,
         num_tokens: int = 5,
     ) -> Tuple[torch.LongTensor, torch.FloatTensor, Optional[Tuple], Optional[torch.Tensor]]:
-        """Generate draft tokens using the draft model with KV cache support.
-        Returns:
-            draft_tokens (Tensor): (B, K)
-            draft_logits (Tensor): (B, K, vocab)
-            draft_past_key_values (tuple): cache
-            draft_hiddens (Tensor|None): (B, K, hidden_size) if affine verifier enabled
         """
-        draft_ids = []
-        draft_logits = []
-        draft_hiddens = []
-        current_ids = input_ids
-        current_mask = attention_mask
-        draft_past_key_values = past_key_values
+        Generate draft tokens using the draft model's optimized `generate` function.
+        This is much faster than a Python loop.
+        """
+        with torch.no_grad():
+            # Use the draft model's own generate function to get all K tokens at once.
+            # This leverages all the internal optimizations of HF's generate.
+            draft_outputs = self.draft_model.generate(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=num_tokens,
+                past_key_values=past_key_values,
+                use_cache=self.spec_config.use_cache,
+                return_dict_in_generate=True,
+                output_scores=True, # We need scores for verification
+                output_hidden_states=self.spec_config.affine_verification,
+                # Use the same sampling settings as the main generation
+                do_sample=self.config.sampling.do_sample,
+                temperature=self.config.sampling.temperature,
+                top_k=self.config.sampling.top_k,
+                top_p=self.config.sampling.top_p,
+            )
+
+        # Extract the generated parts
+        draft_tokens = draft_outputs.sequences[:, input_ids.shape[1]:]
         
-        for i in range(num_tokens):
-            # Forward pass with cache
-            with torch.no_grad():
-                outputs = self.draft_model(
-                    input_ids=current_ids if draft_past_key_values is None else current_ids[:, -1:],
-                    attention_mask=current_mask,
-                    past_key_values=draft_past_key_values,
-                    use_cache=self.spec_config.use_cache,
-                    return_dict=True,
-                    output_hidden_states=self.spec_config.affine_verification
-                )
-            
-            # Get logits and sample
-            logits = outputs.logits[:, -1, :]
-            draft_logits.append(logits)
-            if self.spec_config.affine_verification and outputs.hidden_states is not None:
-                last_hidden = outputs.hidden_states[-1][:, -1, :]
-                draft_hiddens.append(last_hidden)
-            
-            # Apply sampling
-            if self.config.sampling.do_sample:
-                next_token = sample_from_logits(
-                    logits,
-                    temperature=self.config.sampling.temperature,
-                    top_k=self.config.sampling.top_k,
-                    top_p=self.config.sampling.top_p
-                )
-            else:
-                next_token = torch.argmax(logits, dim=-1)
-            
-            draft_ids.append(next_token)
-            
-            # Update for next iteration
-            current_ids = torch.cat([current_ids, next_token.unsqueeze(1)], dim=1)
-            if current_mask is not None:
-                current_mask = torch.cat([current_mask, torch.ones_like(next_token).unsqueeze(1)], dim=1)
-            
-            # Update cache
-            if self.spec_config.use_cache:
-                draft_past_key_values = outputs.past_key_values
-            
-            # Early stopping based on confidence
-            if self.spec_config.dynamic_adjustment:
-                confidence = torch.max(F.softmax(logits, dim=-1), dim=-1)[0].mean().item()
-                if confidence < self.current_confidence_threshold:
-                    break
+        # `scores` is a tuple of logits for each generated token
+        draft_logits = torch.stack(draft_outputs.scores, dim=1)
+
+        new_draft_past = draft_outputs.past_key_values
         
-        draft_tokens = torch.stack(draft_ids, dim=1)
-        draft_logits = torch.stack(draft_logits, dim=1)
-        if self.spec_config.affine_verification and draft_hiddens:
-            draft_hiddens = torch.stack(draft_hiddens, dim=1)  # (B,K,H)
-        else:
-            draft_hiddens = None
-        
-        return draft_tokens, draft_logits, draft_past_key_values, draft_hiddens
+        draft_hiddens = None
+        if self.spec_config.affine_verification and draft_outputs.hidden_states is not None:
+            # `hidden_states` is a tuple of tuples: (num_tokens, num_layers, B, seq_len, H)
+            # We want the last layer's hidden states for the *newly generated* tokens.
+            last_layer_hiddens = draft_outputs.hidden_states[-1] # Tuple of (B, seq, H) for each token
+            
+            # This gathers the hidden state of the *last* token at each generation step
+            hidden_states_list = [h[:, -1, :] for h in last_layer_hiddens]
+            draft_hiddens = torch.stack(hidden_states_list, dim=1) # (B, K, H)
+
+        return draft_tokens, draft_logits, new_draft_past, draft_hiddens
     
     def _pre_filter_tokens(
         self,
@@ -347,6 +320,23 @@ class OptimizedSpeculativeDecoderV2:
                 self.num_assistant_tokens + 1
             )
     
+    def _trim_kv_cache(self, past_key_values: Tuple[Tuple[torch.Tensor, torch.Tensor]], num_to_keep: int):
+        """Trims a KV cache to a specified length."""
+        if past_key_values is None:
+            return None
+        
+        trimmed_cache = []
+        for key, value in past_key_values:
+            # key and value shape: (B, num_heads, seq_len, head_dim)
+            if key.shape[2] > num_to_keep:
+                trimmed_key = key[:, :, :num_to_keep, :]
+                trimmed_value = value[:, :, :num_to_keep, :]
+                trimmed_cache.append((trimmed_key, trimmed_value))
+            else:
+                trimmed_cache.append((key, value))
+        
+        return tuple(trimmed_cache)
+
     @torch.no_grad()
     def generate(
         self,
@@ -472,32 +462,63 @@ class OptimizedSpeculativeDecoderV2:
             
             # Update generated sequences
             max_accepted = max(len(tokens) for tokens in accepted_tokens)
-            padded_accepted = torch.full(
-                (batch_size, max_accepted),
-                pad_token_id,
-                device=device,
-                dtype=generated_ids.dtype
-            )
             
+            # Important: The actual number of new tokens can vary per batch item
+            # We will handle padding and mask updates carefully
+            new_generated_ids_list = []
+            if attention_mask is not None:
+                new_attention_mask_list = []
+
             for i in range(batch_size):
                 if not finished[i]:
+                    # Append accepted tokens for this item
                     new_tokens = accepted_tokens[i]
-                    padded_accepted[i, :len(new_tokens)] = new_tokens
+                    current_item_ids = torch.cat([generated_ids[i:i+1], new_tokens.unsqueeze(0)], dim=1)
+                    new_generated_ids_list.append(current_item_ids)
+
+                    if attention_mask is not None:
+                        new_mask = torch.ones(1, new_tokens.shape[0], dtype=attention_mask.dtype, device=device)
+                        current_item_mask = torch.cat([attention_mask[i:i+1], new_mask], dim=1)
+                        new_attention_mask_list.append(current_item_mask)
+                    
                     if eos_token_id in new_tokens:
                         finished[i] = True
+                else: # if already finished, just carry over
+                    new_generated_ids_list.append(generated_ids[i:i+1])
+                    if attention_mask is not None:
+                        new_attention_mask_list.append(attention_mask[i:i+1])
+
+            # Pad all sequences to the same length for the next batch iteration
+            max_len = max(seq.shape[1] for seq in new_generated_ids_list)
             
-            generated_ids = torch.cat([generated_ids, padded_accepted], dim=1)
+            final_ids = torch.full(
+                (batch_size, max_len), pad_token_id, device=device, dtype=generated_ids.dtype
+            )
             if attention_mask is not None:
-                attention_mask = torch.cat([
-                    attention_mask,
-                    torch.ones(batch_size, max_accepted, device=device)
-                ], dim=1)
+                final_mask = torch.zeros(
+                    (batch_size, max_len), device=device, dtype=attention_mask.dtype
+                )
+
+            for i in range(batch_size):
+                seq_len = new_generated_ids_list[i].shape[1]
+                final_ids[i, :seq_len] = new_generated_ids_list[i]
+                if attention_mask is not None:
+                    final_mask[i, :seq_len] = new_attention_mask_list[i]
             
+            generated_ids = final_ids
+            if attention_mask is not None:
+                attention_mask = final_mask
+
             # Update KV caches
             if self.spec_config.use_cache:
-                target_past_key_values = target_outputs.past_key_values
-                # Reset draft cache since we accepted some tokens
-                draft_past_key_values = None
+                # The new cache length should be the length of the sequence *before* this iteration's accepted tokens
+                # The target_outputs.past_key_values contains state for `cur_len + num_filtered` tokens
+                # We need to trim it back to `cur_len + num_accepted_for_that_batch_item`
+                # For simplicity in batching, we trim to the new max_len, which is correct
+                new_cache_len = generated_ids.shape[1]
+                
+                target_past_key_values = self._trim_kv_cache(target_outputs.past_key_values, new_cache_len)
+                draft_past_key_values = self._trim_kv_cache(target_outputs.past_key_values, new_cache_len)
             
             # Update progress
             pbar.update(max_accepted)
