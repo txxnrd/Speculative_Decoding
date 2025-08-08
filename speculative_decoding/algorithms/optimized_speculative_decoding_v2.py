@@ -109,27 +109,21 @@ class OptimizedSpeculativeDecoderV2:
         num_tokens: int = 5,
     ) -> Tuple[torch.LongTensor, torch.FloatTensor, Optional[Tuple], Optional[torch.Tensor]]:
         """
-        Generate draft tokens using the draft model's optimized `generate` function.
-        This is much faster than a Python loop.
+        Generate draft tokens using the draft model.
+        When using cache, we use a manual loop to avoid HuggingFace generate complexities.
         """
-        # When using a KV cache, we only need to pass the last token of the input_ids.
-        if past_key_values is not None:
-            prompt_len = past_key_values[0][0].shape[2]
-            generate_input_ids = input_ids[:, -1:]
-            # Avoid passing a mismatched attention_mask when using cache
-            attn_for_gen = None
-        else:
-            prompt_len = input_ids.shape[1]
-            generate_input_ids = input_ids
-            attn_for_gen = attention_mask
-
+        if past_key_values is not None and self.spec_config.use_cache:
+            # Manual generation loop when using cache
+            return self._get_draft_tokens_manual(
+                input_ids, attention_mask, past_key_values, num_tokens
+            )
+        
+        # When not using cache, use HuggingFace generate for simplicity
         with torch.no_grad():
-            # Use the draft model's own generate function to get all K tokens at once.
             draft_outputs = self.draft_model.generate(
-                input_ids=generate_input_ids,
-                attention_mask=attn_for_gen,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
                 max_new_tokens=num_tokens,
-                past_key_values=past_key_values,
                 use_cache=self.spec_config.use_cache,
                 return_dict_in_generate=True,
                 output_scores=True,
@@ -141,14 +135,8 @@ class OptimizedSpeculativeDecoderV2:
                 pad_token_id=self.tokenizer.eos_token_id,
             )
 
-        # The output sequences will contain the full context, so we slice the new tokens.
-        # When using cache, the prompt length is `past_key_values` length + 1 (the new token)
-        if past_key_values is not None:
-            total_len_before_new = past_key_values[0][0].shape[2] + 1
-        else:
-            total_len_before_new = input_ids.shape[1]
-            
-        draft_tokens = draft_outputs.sequences[:, total_len_before_new:]
+        # Extract new tokens
+        draft_tokens = draft_outputs.sequences[:, input_ids.shape[1]:]
         
         # `scores` is a tuple of logits for each generated token
         draft_logits = torch.stack(draft_outputs.scores, dim=1)
@@ -162,6 +150,69 @@ class OptimizedSpeculativeDecoderV2:
             draft_hiddens = torch.stack(hidden_states_list, dim=1)
 
         return draft_tokens, draft_logits, new_draft_past, draft_hiddens
+    
+    def _get_draft_tokens_manual(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Tuple] = None,
+        num_tokens: int = 5,
+    ) -> Tuple[torch.LongTensor, torch.FloatTensor, Optional[Tuple], Optional[torch.Tensor]]:
+        """Manual generation loop for when using KV cache."""
+        batch_size = input_ids.shape[0]
+        device = input_ids.device
+        
+        # Start with the last token when using cache
+        current_input_ids = input_ids[:, -1:]
+        current_past = past_key_values
+        
+        draft_tokens = []
+        draft_logits = []
+        draft_hiddens_list = [] if self.spec_config.affine_verification else None
+        
+        for _ in range(num_tokens):
+            with torch.no_grad():
+                outputs = self.draft_model(
+                    input_ids=current_input_ids,
+                    past_key_values=current_past,
+                    use_cache=True,
+                    output_hidden_states=self.spec_config.affine_verification,
+                )
+            
+            logits = outputs.logits[:, -1, :]  # [batch_size, vocab_size]
+            
+            # Sample next token
+            if self.config.sampling.do_sample:
+                probs = torch.nn.functional.softmax(logits / self.config.sampling.temperature, dim=-1)
+                if self.config.sampling.top_k > 0:
+                    probs, indices = torch.topk(probs, self.config.sampling.top_k, dim=-1)
+                    next_token = indices.gather(-1, torch.multinomial(probs, 1))
+                else:
+                    next_token = torch.multinomial(probs, 1)
+            else:
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            
+            draft_tokens.append(next_token)
+            draft_logits.append(logits)
+            
+            if self.spec_config.affine_verification and outputs.hidden_states is not None:
+                # Get the last hidden state from the last layer
+                last_hidden = outputs.hidden_states[-1][:, -1, :]
+                draft_hiddens_list.append(last_hidden)
+            
+            # Update for next iteration
+            current_input_ids = next_token
+            current_past = outputs.past_key_values
+        
+        # Stack results
+        draft_tokens = torch.cat(draft_tokens, dim=1)  # [batch_size, num_tokens]
+        draft_logits = torch.stack(draft_logits, dim=1)  # [batch_size, num_tokens, vocab_size]
+        
+        draft_hiddens = None
+        if draft_hiddens_list:
+            draft_hiddens = torch.stack(draft_hiddens_list, dim=1)  # [batch_size, num_tokens, hidden_size]
+        
+        return draft_tokens, draft_logits, current_past, draft_hiddens
     
     def _pre_filter_tokens(
         self,
