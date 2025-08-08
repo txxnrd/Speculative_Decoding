@@ -140,11 +140,11 @@ def main():
     # Model configuration
     cfg = Config(
         draft_model=ModelConfig(
-            model_path="/hdd1/taeyun/Llama-3.1-8B-Instruct",
+            model_path="/raid/junha/models/Llama-3.1-8B-Instruct",
             device="auto",
         ),
         target_model=ModelConfig(
-            model_path="/hdd1/taeyun/Llama-3.1-70B-Instruct",
+            model_path="/raid/junha/models/Llama-3.1-70B-Instruct",
             device="auto",
         ),
         sampling=SamplingConfig(
@@ -155,43 +155,43 @@ def main():
     loader = ModelLoader(logger=logger)
     draft, target, tok = loader.load_draft_and_target_models(cfg.draft_model, cfg.target_model)
     
-    # # Baseline (KV cache enabled by default in HF)
-    # base_stats = run_baseline(target, tok, questions, args.max_new, logger)
+    # Baseline (KV cache enabled by default in HF)
+    base_stats = run_baseline(target, tok, questions, args.max_new, logger)
 
-    # # Our implementation - Basic speculative (with KV cache)
-    # spec_cfg_basic = SpeculativeDecodingConfig(num_assistant_tokens=5, use_cache=True, verbose=False)
-    # dec_basic = OptimizedSpeculativeDecoderV2(draft, target, tok, cfg, spec_cfg_basic, logger)
-    # basic_stats = run_spec(dec_basic, tok, questions, args.max_new, logger, "Our Basic Speculative (KV)")
+    # Our implementation - Basic speculative (with KV cache)
+    spec_cfg_basic = SpeculativeDecodingConfig(num_assistant_tokens=5, use_cache=True, verbose=False)
+    dec_basic = OptimizedSpeculativeDecoderV2(draft, target, tok, cfg, spec_cfg_basic, logger)
+    basic_stats = run_spec(dec_basic, tok, questions, args.max_new, logger, "Our Basic Speculative (KV)")
 
-    # # Our implementation - Affine speculative (with KV cache)
-    # spec_cfg_aff = SpeculativeDecodingConfig(
-    #     num_assistant_tokens=5,
-    #     affine_verification=True,
-    #     affine_model_path=args.affine_model,
-    #     affine_accept_threshold=0.5,
-    #     use_cache=True,
-    #     verbose=False,
-    # )
-    # dec_aff = OptimizedSpeculativeDecoderV2(draft, target, tok, cfg, spec_cfg_aff, logger)
-    # affine_stats = run_spec(dec_aff, tok, questions, args.max_new, logger, "Our Affine Speculative (KV)")
+    # Our implementation - Affine speculative (with KV cache)
+    spec_cfg_aff = SpeculativeDecodingConfig(
+        num_assistant_tokens=5,
+        affine_verification=True,
+        affine_model_path=args.affine_model,
+        affine_accept_threshold=0.5,
+        use_cache=True,
+        verbose=False,
+    )
+    dec_aff = OptimizedSpeculativeDecoderV2(draft, target, tok, cfg, spec_cfg_aff, logger)
+    affine_stats = run_spec(dec_aff, tok, questions, args.max_new, logger, "Our Affine Speculative (KV)")
 
-    # # HuggingFace native speculative decoding
-    # hf_spec_stats = run_hf_speculative(draft, target, tok, questions, args.max_new, logger)
+    # HuggingFace native speculative decoding
+    hf_spec_stats = run_hf_speculative(draft, target, tok, questions, args.max_new, logger)
 
-    # Load verifier for HF+Affine
-    from speculative_decoding.algorithms.affine_alignment import AffineVerifier
-    state = torch.load(args.affine_model, map_location="cpu")
-    verifier = AffineVerifier.from_state_dict(state).to(draft.device)
-    verifier.eval()
+    # # Load verifier for HF+Affine
+    # from speculative_decoding.algorithms.affine_alignment import AffineVerifier
+    # state = torch.load(args.affine_model, map_location="cpu")
+    # verifier = AffineVerifier.from_state_dict(state).to(draft.device)
+    # verifier.eval()
 
-    # HF+Affine speculative decoding
-    hf_aff_stats = run_hf_affine(draft, target, verifier, tok, questions, args.max_new, logger, threshold=args.affine_threshold)
+    # # HF+Affine speculative decoding
+    # hf_aff_stats = run_hf_affine(draft, target, verifier, tok, questions, args.max_new, logger, threshold=args.affine_threshold)
 
-    # Summary
+    # # Summary
     logger.info("\n" + "="*40 + " FINAL RESULTS " + "="*40)
     logger.info(f"Baseline                : {avg(base_stats,'tps'):.1f} tok/s")
     logger.info(f"HF Speculative          : {avg(hf_spec_stats,'tps'):.1f} tok/s")
-    logger.info(f"HF+Affine Speculative   : {avg(hf_aff_stats,'tps'):.1f} tok/s")
+    # logger.info(f"HF+Affine Speculative   : {avg(hf_aff_stats,'tps'):.1f} tok/s")
     logger.info("-"*95)
     logger.info(f"Our Basic Speculative   : {avg(basic_stats,'tokens_per_second'):.1f} tok/s (acc {avg(basic_stats,'acceptance_rate'):.1%})")
     logger.info(f"Our Affine Speculative  : {avg(affine_stats,'tokens_per_second'):.1f} tok/s (acc {avg(affine_stats,'acceptance_rate'):.1%})")
