@@ -112,19 +112,27 @@ class OptimizedSpeculativeDecoderV2:
         Generate draft tokens using the draft model's optimized `generate` function.
         This is much faster than a Python loop.
         """
+        # When using a KV cache, we only need to pass the last token of the input_ids.
+        # The generate function will handle the rest based on the cache.
+        if past_key_values is not None:
+            # The length of the prompt is encoded in the cache.
+            prompt_len = past_key_values[0][0].shape[2]
+            generate_input_ids = input_ids[:, -1:]
+        else:
+            prompt_len = input_ids.shape[1]
+            generate_input_ids = input_ids
+
         with torch.no_grad():
             # Use the draft model's own generate function to get all K tokens at once.
-            # This leverages all the internal optimizations of HF's generate.
             draft_outputs = self.draft_model.generate(
-                input_ids=input_ids,
+                input_ids=generate_input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=num_tokens,
                 past_key_values=past_key_values,
                 use_cache=self.spec_config.use_cache,
                 return_dict_in_generate=True,
-                output_scores=True, # We need scores for verification
+                output_scores=True,
                 output_hidden_states=self.spec_config.affine_verification,
-                # Use the same sampling settings as the main generation
                 do_sample=self.config.sampling.do_sample,
                 temperature=self.config.sampling.temperature,
                 top_k=self.config.sampling.top_k,
@@ -132,7 +140,8 @@ class OptimizedSpeculativeDecoderV2:
             )
 
         # Extract the generated parts
-        draft_tokens = draft_outputs.sequences[:, input_ids.shape[1]:]
+        # The output sequences will contain the full context, so we slice the new tokens.
+        draft_tokens = draft_outputs.sequences[:, prompt_len:]
         
         # `scores` is a tuple of logits for each generated token
         draft_logits = torch.stack(draft_outputs.scores, dim=1)
@@ -141,13 +150,9 @@ class OptimizedSpeculativeDecoderV2:
         
         draft_hiddens = None
         if self.spec_config.affine_verification and draft_outputs.hidden_states is not None:
-            # `hidden_states` is a tuple of tuples: (num_tokens, num_layers, B, seq_len, H)
-            # We want the last layer's hidden states for the *newly generated* tokens.
-            last_layer_hiddens = draft_outputs.hidden_states[-1] # Tuple of (B, seq, H) for each token
-            
-            # This gathers the hidden state of the *last* token at each generation step
+            last_layer_hiddens = draft_outputs.hidden_states[-1]
             hidden_states_list = [h[:, -1, :] for h in last_layer_hiddens]
-            draft_hiddens = torch.stack(hidden_states_list, dim=1) # (B, K, H)
+            draft_hiddens = torch.stack(hidden_states_list, dim=1)
 
         return draft_tokens, draft_logits, new_draft_past, draft_hiddens
     
