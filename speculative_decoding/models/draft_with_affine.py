@@ -65,6 +65,14 @@ class DraftModelWithAffine(PreTrainedModel):
         except Exception:
             return torch.float32
 
+    # HF AssistedCandidateGenerator checks this on assistant_model
+    def _supports_logits_to_keep(self) -> bool:  # type: ignore
+        try:
+            fn = getattr(self.wrapped_model, "_supports_logits_to_keep")
+            return bool(fn())
+        except Exception:
+            return True
+
     # ------------------------------------------------------------------
     # Delegation helpers
     # ------------------------------------------------------------------
