@@ -113,11 +113,15 @@ class OptimizedSpeculativeDecoderV2:
         This is much faster than a Python loop.
         """
         # When using a KV cache, we only need to pass the last token of the input_ids.
-        # The generate function will handle the rest based on the cache.
         if past_key_values is not None:
-            # The length of the prompt is encoded in the cache.
             prompt_len = past_key_values[0][0].shape[2]
             generate_input_ids = input_ids[:, -1:]
+            
+            # The attention mask needs to be extended to include the new token
+            if attention_mask is not None:
+                attention_mask = torch.cat(
+                    [attention_mask, torch.ones_like(generate_input_ids)], dim=-1
+                )
         else:
             prompt_len = input_ids.shape[1]
             generate_input_ids = input_ids
@@ -137,11 +141,17 @@ class OptimizedSpeculativeDecoderV2:
                 temperature=self.config.sampling.temperature,
                 top_k=self.config.sampling.top_k,
                 top_p=self.config.sampling.top_p,
+                pad_token_id=self.tokenizer.eos_token_id, # Prevent warnings
             )
 
-        # Extract the generated parts
         # The output sequences will contain the full context, so we slice the new tokens.
-        draft_tokens = draft_outputs.sequences[:, prompt_len:]
+        # When using cache, the prompt length is `past_key_values` length + 1 (the new token)
+        if past_key_values is not None:
+            total_len_before_new = past_key_values[0][0].shape[2] + 1
+        else:
+            total_len_before_new = input_ids.shape[1]
+            
+        draft_tokens = draft_outputs.sequences[:, total_len_before_new:]
         
         # `scores` is a tuple of logits for each generated token
         draft_logits = torch.stack(draft_outputs.scores, dim=1)
