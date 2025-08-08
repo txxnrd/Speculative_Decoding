@@ -19,11 +19,11 @@ class DraftModelWithAffine(PreTrainedModel):
     using an affine verifier before they reach the target model."""
 
     def __init__(self, base_model: PreTrainedModel, affine_verifier, threshold: float = 0.5):
+        # IMPORTANT: initialize parent before assigning Module attributes
+        super().__init__(base_model.config)
         self.base_model = base_model
-        self.config = base_model.config  # satisfy PreTrainedModel requirements
         self.affine_verifier = affine_verifier
         self.threshold = threshold
-        super().__init__(self.config)
         # tie parameters etc. not needed because we delegate
 
     # ------------------------------------------------------------------
