@@ -1,0 +1,76 @@
+# --- OS / Editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.history/
+
+# --- Python cache/build ---
+__pycache__/
+*.py[cod]
+*$py.class
+.build/
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+.mamba/
+.conda/
+.python-version
+
+# --- Testing / Linting caches ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.coverage
+coverage.xml
+htmlcov/
+
+# --- Logs / Outputs ---
+logs/
+*.log
+nohup.out
+*.out
+*.err
+# repo-local logs
+affine_v3_training.log
+
+# --- Data / Caches ---
+cache/
+.cache/
+dataset_cache/
+datasets/
+outputs/
+results/
+runs/
+wandb/
+lightning_logs/
+
+# --- Model weights / checkpoints (large) ---
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.safetensors
+checkpoints/
+models/
+# explicitly ignore the verifier in repo
+/affine_verifier_v3_large.pt
+
+# --- Notebooks ---
+.ipynb_checkpoints/
+
+# --- Hugging Face / Transformers temp ---
+.huggingface/
+transformers_cache/
+
+# --- Misc ---
+*.tmp
+*.temp 
