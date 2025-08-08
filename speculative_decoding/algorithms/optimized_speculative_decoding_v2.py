@@ -116,21 +116,18 @@ class OptimizedSpeculativeDecoderV2:
         if past_key_values is not None:
             prompt_len = past_key_values[0][0].shape[2]
             generate_input_ids = input_ids[:, -1:]
-            
-            # The attention mask needs to be extended to include the new token
-            if attention_mask is not None:
-                attention_mask = torch.cat(
-                    [attention_mask, torch.ones_like(generate_input_ids)], dim=-1
-                )
+            # Avoid passing a mismatched attention_mask when using cache
+            attn_for_gen = None
         else:
             prompt_len = input_ids.shape[1]
             generate_input_ids = input_ids
+            attn_for_gen = attention_mask
 
         with torch.no_grad():
             # Use the draft model's own generate function to get all K tokens at once.
             draft_outputs = self.draft_model.generate(
                 input_ids=generate_input_ids,
-                attention_mask=attention_mask,
+                attention_mask=attn_for_gen,
                 max_new_tokens=num_tokens,
                 past_key_values=past_key_values,
                 use_cache=self.spec_config.use_cache,
@@ -141,7 +138,7 @@ class OptimizedSpeculativeDecoderV2:
                 temperature=self.config.sampling.temperature,
                 top_k=self.config.sampling.top_k,
                 top_p=self.config.sampling.top_p,
-                pad_token_id=self.tokenizer.eos_token_id, # Prevent warnings
+                pad_token_id=self.tokenizer.eos_token_id,
             )
 
         # The output sequences will contain the full context, so we slice the new tokens.
