@@ -112,13 +112,14 @@ def collect_acceptance_data_kvcache(
                     draft_prob = 1e-10
                 acceptance_prob = min(1.0, target_prob / draft_prob)
                 
-                # Convert to binary label (deterministic for consistency)
-                is_accepted = acceptance_prob > 0.5  # Could also use random sampling
+                # CHANGED: Use actual acceptance probability as target (regression)
+                # instead of binary classification
+                acceptance_label = acceptance_prob
                 
                 # Store data
                 draft_hiddens.append(draft_hidden.cpu())
                 target_hiddens.append(target_hidden.cpu()) 
-                acceptance_labels.append(float(is_accepted))
+                acceptance_labels.append(acceptance_label)  # Now a float in [0, 1]
                 
                 total_pairs += 1
                 
@@ -206,7 +207,8 @@ def main():
     labels = labels.to(device)
     
     # Training setup
-    criterion = torch.nn.BCEWithLogitsLoss()
+    # CHANGED: Use MSE loss for regression instead of BCE for classification
+    criterion = torch.nn.MSELoss()
     optimizer = torch.optim.Adam(verifier.mlp.parameters(), lr=args.lr)
     
     # Create data loader
@@ -222,7 +224,9 @@ def main():
         
         for batch_draft, batch_labels in dataloader:
             logits = verifier(batch_draft)
-            loss = criterion(logits.squeeze(), batch_labels.float())
+            # Apply sigmoid to get probabilities in [0, 1]
+            probs = torch.sigmoid(logits.squeeze())
+            loss = criterion(probs, batch_labels.float())
             
             optimizer.zero_grad()
             loss.backward()
@@ -230,10 +234,10 @@ def main():
             
             total_loss += loss.item()
             
-            # Calculate accuracy
-            probs = torch.sigmoid(logits.squeeze())
-            predicted = (probs > 0.5).float()
-            correct += (predicted == batch_labels).sum().item()
+            # Calculate accuracy (predictions within threshold of true value)
+            # For regression, we'll measure how many predictions are within 0.1 of true value
+            error = torch.abs(probs - batch_labels)
+            correct += (error < 0.1).sum().item()
             total += batch_labels.size(0)
         
         accuracy = correct / total

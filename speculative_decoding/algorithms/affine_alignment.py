@@ -69,12 +69,40 @@ class AffineVerifier(nn.Module):
         if hasattr(target_hidden_size, 'item'):
             target_hidden_size = target_hidden_size.item()
         
-        mlp_hidden = state.get("mlp_hidden", 256) # Backwards compatibility
-        if hasattr(mlp_hidden, 'item'):
-            mlp_hidden = mlp_hidden.item()
-            
-        model = cls(W, b, draft_hidden_size, target_hidden_size, mlp_hidden=mlp_hidden)
-        model.mlp.load_state_dict(state["mlp"])
+        # Build a temporary model first with any valid mlp_hidden (will rebuild below if needed)
+        mlp_hidden_meta = state.get("mlp_hidden", 256)  # may be inconsistent with saved mlp weights
+        if hasattr(mlp_hidden_meta, 'item'):
+            mlp_hidden_meta = mlp_hidden_meta.item()
+        
+        model = cls(W, b, draft_hidden_size, target_hidden_size, mlp_hidden=mlp_hidden_meta)
+        
+        # If an MLP state dict is provided, reconstruct the MLP to MATCH its shapes
+        mlp_state = state.get("mlp")
+        if isinstance(mlp_state, dict):
+            # Infer layer sizes from checkpoint
+            # Expected keys like '0.weight', '2.weight', '4.weight'
+            first_w = None
+            second_w = None
+            for k, v in mlp_state.items():
+                if k.endswith("0.weight"):
+                    first_w = v
+                elif k.endswith("2.weight"):
+                    second_w = v
+            if first_w is not None:
+                hidden1 = first_w.shape[0]
+                # Fall back if second_w missing
+                hidden2 = second_w.shape[0] if second_w is not None else max(1, hidden1 // 2)
+                # Rebuild MLP to match checkpoint shapes
+                model.mlp = nn.Sequential(
+                    nn.Linear(target_hidden_size, hidden1),
+                    nn.ReLU(),
+                    nn.Linear(hidden1, hidden2),
+                    nn.ReLU(),
+                    nn.Linear(hidden2, 1)
+                )
+            # Finally, load weights
+            model.mlp.load_state_dict(mlp_state)
+        
         return model
 
 

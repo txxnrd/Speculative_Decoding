@@ -26,10 +26,12 @@ def run_baseline(target_model, tokenizer, questions, max_new_tokens, logger):
     stats = []
     for i, q in enumerate(questions):
         input_ids = tokenizer.encode(q, return_tensors="pt").to(target_model.device)
+        attention_mask = torch.ones_like(input_ids)
         start = time.time()
         with torch.no_grad():
             _ = target_model.generate(
                 input_ids=input_ids,
+                attention_mask=attention_mask,
                 max_new_tokens=max_new_tokens,
                 do_sample=True,
                 temperature=0.7,
@@ -47,8 +49,14 @@ def run_spec(decoder, tokenizer, questions, max_new_tokens, logger, tag):
     logger.info(f"Running {tag} generation…")
     stats = []
     for i, q in enumerate(questions):
-        input_ids = tokenizer.encode(q, return_tensors="pt").to("cuda")
-        out = decoder.generate(input_ids=input_ids, max_new_tokens=max_new_tokens)
+        inputs = tokenizer(q, return_tensors="pt", truncation=True, max_length=1024)
+        input_ids = inputs.input_ids.to("cuda")
+        attention_mask = inputs.attention_mask.to("cuda")
+        out = decoder.generate(
+            input_ids=input_ids, 
+            attention_mask=attention_mask,
+            max_new_tokens=max_new_tokens
+        )
         s = out["stats"]
         logger.info(
             f"  {tag} {i+1}: {s['total_tokens']} tokens in {s['total_time']:.2f}s "
@@ -66,11 +74,13 @@ def run_hf_speculative(draft_model, target_model, tokenizer, questions, max_new_
     stats = []
     for i, q in enumerate(questions):
         input_ids = tokenizer.encode(q, return_tensors="pt").to(target_model.device)
+        attention_mask = torch.ones_like(input_ids)
         
         start_time = time.time()
         with torch.no_grad():
             outputs = target_model.generate(
                 input_ids=input_ids,
+                attention_mask=attention_mask,
                 assistant_model=draft_model,
                 max_new_tokens=max_new_tokens,
                 do_sample=True,
@@ -99,10 +109,12 @@ def run_hf_affine(draft_model, target_model, verifier, tokenizer, questions, max
     stats = []
     for i, q in enumerate(questions):
         input_ids = tokenizer.encode(q, return_tensors="pt").to(target_model.device)
+        attention_mask = torch.ones_like(input_ids)
         start = time.time()
         with torch.no_grad():
             out = target_model.generate(
                 input_ids=input_ids,
+                attention_mask=attention_mask,
                 assistant_model=wrapped_draft,
                 max_new_tokens=max_new_tokens,
                 do_sample=True,
@@ -172,20 +184,20 @@ def main():
     # HuggingFace native speculative decoding
     hf_spec_stats = run_hf_speculative(draft, target, tok, questions, args.max_new, logger)
 
-    # Load verifier for HF+Affine
-    from speculative_decoding.algorithms.affine_alignment import AffineVerifier
-    state = torch.load(args.affine_model, map_location="cpu")
-    verifier = AffineVerifier.from_state_dict(state).to(draft.device)
-    verifier.eval()
+    # # Load verifier for HF+Affine
+    # from speculative_decoding.algorithms.affine_alignment import AffineVerifier
+    # state = torch.load(args.affine_model, map_location="cpu")
+    # verifier = AffineVerifier.from_state_dict(state).to(draft.device)
+    # verifier.eval()
 
-    # HF+Affine speculative decoding
-    hf_aff_stats = run_hf_affine(draft, target, verifier, tok, questions, args.max_new, logger, threshold=args.affine_threshold)
+    # # HF+Affine speculative decoding
+    # hf_aff_stats = run_hf_affine(draft, target, verifier, tok, questions, args.max_new, logger, threshold=args.affine_threshold)
 
-    # Summary
+    # # Summary
     logger.info("\n" + "="*40 + " FINAL RESULTS " + "="*40)
     logger.info(f"Baseline                : {avg(base_stats,'tps'):.1f} tok/s")
     logger.info(f"HF Speculative          : {avg(hf_spec_stats,'tps'):.1f} tok/s")
-    logger.info(f"HF+Affine Speculative   : {avg(hf_aff_stats,'tps'):.1f} tok/s")
+    # logger.info(f"HF+Affine Speculative   : {avg(hf_aff_stats,'tps'):.1f} tok/s")
     logger.info("-"*95)
     logger.info(f"Our Basic Speculative   : {avg(basic_stats,'tokens_per_second'):.1f} tok/s (acc {avg(basic_stats,'acceptance_rate'):.1%})")
     logger.info(f"Our Affine Speculative  : {avg(affine_stats,'tokens_per_second'):.1f} tok/s (acc {avg(affine_stats,'acceptance_rate'):.1%})")
