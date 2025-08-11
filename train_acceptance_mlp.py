@@ -56,14 +56,15 @@ class SimpleMLP(nn.Module):
             layers.append(nn.ReLU())
             prev_dim = hidden_dim
         
-        # Output layer
+        # Output layer (no sigmoid here, will use BCEWithLogitsLoss)
         layers.append(nn.Linear(prev_dim, 1))
-        layers.append(nn.Sigmoid())
         
         self.mlp = nn.Sequential(*layers)
     
     def forward(self, x):
-        return self.mlp(x).squeeze(-1)
+        # x shape: [batch_size, input_dim]
+        output = self.mlp(x)  # [batch_size, 1]
+        return output.squeeze(1)  # [batch_size]
 
 
 def collect_training_data(
@@ -165,9 +166,12 @@ def train_mlp(
     """Train the MLP"""
     mlp.to(device)
     optimizer = optim.Adam(mlp.parameters(), lr=lr)
-    criterion = nn.BCELoss()
+    criterion = nn.BCEWithLogitsLoss()  # Use BCEWithLogitsLoss for numerical stability
     
     history = {'train_loss': [], 'val_loss': [], 'val_acc': []}
+    best_val_acc = 0.0
+    patience = 5
+    patience_counter = 0
     
     for epoch in range(num_epochs):
         # Training
@@ -179,7 +183,7 @@ def train_mlp(
             accepted = accepted.to(device)
             
             optimizer.zero_grad()
-            predictions = mlp(aligned_hidden)
+            predictions = mlp(aligned_hidden)  # Raw logits
             loss = criterion(predictions, accepted)
             loss.backward()
             optimizer.step()
@@ -197,12 +201,13 @@ def train_mlp(
                 aligned_hidden = aligned_hidden.to(device)
                 accepted = accepted.to(device)
                 
-                predictions = mlp(aligned_hidden)
+                predictions = mlp(aligned_hidden)  # Raw logits
                 loss = criterion(predictions, accepted)
                 val_losses.append(loss.item())
                 
-                # Calculate accuracy
-                predicted_class = (predictions > 0.5).float()
+                # Calculate accuracy - apply sigmoid for probability
+                probs = torch.sigmoid(predictions)
+                predicted_class = (probs > 0.5).float()
                 correct += (predicted_class == accepted).sum().item()
                 total += accepted.shape[0]
         
@@ -216,6 +221,26 @@ def train_mlp(
         
         print(f"Epoch {epoch+1}: Train Loss={avg_train_loss:.4f}, "
               f"Val Loss={avg_val_loss:.4f}, Val Acc={val_acc:.4f}")
+        
+        # Save best model
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            patience_counter = 0
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': mlp.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_acc': val_acc,
+                'history': history
+            }, 'best_acceptance_mlp.pt')
+            print(f"  → Saved best model (val_acc: {val_acc:.4f})")
+        else:
+            patience_counter += 1
+            
+        # Early stopping
+        if patience_counter >= patience:
+            print(f"Early stopping triggered after {epoch+1} epochs")
+            break
     
     return history
 

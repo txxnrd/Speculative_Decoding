@@ -85,4 +85,9 @@ checkpoints/
 # data/
 # *.csv
 # *.json
-# *.txt 
+# *.txt
+
+# Training data and models
+acceptance_training_data_*.json
+acceptance_mlp_*.pt
+best_acceptance_mlp.pt 
