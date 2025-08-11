@@ -579,9 +579,10 @@ class SpeculativeDecoder:
             # Additional diagnostics: KL divergence and top-k overlap for first few positions on best path
             try:
                 if best_path is not None and max_accepted_length > 0:
-                    # Extract target logits slice for best path
-                    target_logits_slice = all_logits[best_path_idx, :max_accepted_length, :]
-                    target_probs = F.softmax(target_logits_slice, dim=-1)
+                    # Use float32 for numerical stability
+                    target_logits_slice = all_logits[best_path_idx, :max_accepted_length, :].to(torch.float32)
+                    log_target_probs = F.log_softmax(target_logits_slice, dim=-1)
+                    target_probs = log_target_probs.exp()
                     # If draft diagnostics exist, build draft distributions at these steps
                     if getattr(best_path, 'draft_topk_tokens', None) and getattr(best_path, 'draft_topk_probs', None):
                         kl_list = []
@@ -590,26 +591,57 @@ class SpeculativeDecoder:
                             draft_tokens = best_path.draft_topk_tokens[step_idx]
                             draft_probs = best_path.draft_topk_probs[step_idx]
                             if draft_tokens and draft_probs:
-                                # Build sparse draft distribution vector
                                 vocab_size = target_probs.shape[-1]
-                                draft_dist = torch.full((vocab_size,), 1e-9, device=target_probs.device)
+                                draft_dist = torch.full((vocab_size,), 1e-9, device=target_probs.device, dtype=torch.float32)
                                 for t_id, p in zip(draft_tokens, draft_probs):
                                     if 0 <= t_id < vocab_size:
                                         draft_dist[t_id] = max(float(p), 1e-9)
                                 draft_dist = draft_dist / draft_dist.sum()
-                                tgt_p = target_probs[step_idx]
-                                # KL(draft || target)
-                                kl_val = torch.sum(draft_dist * (torch.log(draft_dist) - torch.log(tgt_p + 1e-9))).item()
+                                tgt_logp = log_target_probs[step_idx]
+                                # KL(draft || target) with log-probs
+                                kl_val = torch.sum(draft_dist * (torch.log(draft_dist) - tgt_logp)).item()
                                 kl_list.append(kl_val)
                                 # Top-k overlap
                                 k = min(10, vocab_size)
-                                tgt_topk = torch.topk(tgt_p, k).indices.tolist()
+                                tgt_topk = torch.topk(target_probs[step_idx], k).indices.tolist()
                                 overlap = len(set(draft_tokens[:k]).intersection(set(tgt_topk))) / float(k)
                                 overlap_list.append(overlap)
                         if kl_list:
                             diag_entry['avg_kl_draft_target'] = float(np.mean(kl_list))
                         if overlap_list:
                             diag_entry['avg_topk_overlap@10'] = float(np.mean(overlap_list))
+                # First-step metrics across all verified paths
+                first_step_mask = [vl > 0 for vl in valid_lengths]
+                if any(first_step_mask):
+                    logits_first = all_logits[[i for i, m in enumerate(first_step_mask) if m], 0, :].to(torch.float32)
+                    logp_first = F.log_softmax(logits_first, dim=-1)
+                    p_first = logp_first.exp()
+                    draft_first_tokens = [paths[i].token_ids[0] for i, m in enumerate(first_step_mask) if m]
+                    # Top1 match rate
+                    pred_first = torch.argmax(logits_first, dim=-1).tolist()
+                    top1_match = np.mean([int(t == d) for t, d in zip(pred_first, draft_first_tokens)])
+                    # Average rank and target prob of draft token
+                    ranks = []
+                    tgt_probs_of_draft = []
+                    overlaps = []
+                    tgt_top10 = torch.topk(p_first, k=min(10, p_first.shape[-1]), dim=-1).indices.tolist()
+                    for row_idx, d_tok in enumerate(draft_first_tokens):
+                        logits_row = logits_first[row_idx]
+                        # rank = 1 + number of logits >= draft logit
+                        rank = int((logits_row >= logits_row[d_tok]).sum().item())
+                        ranks.append(rank)
+                        tgt_probs_of_draft.append(float(p_first[row_idx, d_tok].item()))
+                        # overlap@10 with draft top-10 if available
+                        if getattr(paths[row_idx], 'draft_topk_tokens', None):
+                            draft_top10 = (paths[row_idx].draft_topk_tokens[0] or [])[:10]
+                            overlaps.append(len(set(draft_top10).intersection(set(tgt_top10[row_idx]))) / float(len(tgt_top10[row_idx])))
+                    diag_entry['first_step_top1_match_rate'] = float(top1_match)
+                    if ranks:
+                        diag_entry['first_step_avg_rank'] = float(np.mean(ranks))
+                    if tgt_probs_of_draft:
+                        diag_entry['first_step_avg_target_prob_of_draft'] = float(np.mean(tgt_probs_of_draft))
+                    if overlaps:
+                        diag_entry['first_step_avg_overlap@10'] = float(np.mean(overlaps))
             except Exception:
                 pass
             
