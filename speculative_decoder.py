@@ -373,22 +373,16 @@ class SpeculativeDecoder:
         for path in tree_paths:
             if path.aligned_states is not None:
                 with torch.no_grad():
-                    token_probs = []
                     # aligned_states shape: [1, seq_len, hidden_size]
-                    for token_idx in range(path.aligned_states.shape[1]):
-                        token_feat = path.aligned_states[0, token_idx].to(self.primary_device)
-                        # Ensure dtype matches MLP weights to avoid mismatch (e.g., float16 vs float32)
-                        target_dtype = self.acceptance_predictor.mlp[0].weight.dtype
-                        if token_feat.dtype != target_dtype:
-                            token_feat = token_feat.to(dtype=target_dtype)
-                        prob_logit = self.acceptance_predictor(token_feat.unsqueeze(0))  # [1]
-                        prob = torch.sigmoid(prob_logit).item()
-                        token_probs.append(prob)
-                    # Aggregate token probs to path-level probability (mean)
-                    if token_probs:
-                        acceptance_prob = float(np.mean(token_probs))
-                    else:
-                        acceptance_prob = 0.0
+                    aligned_states = path.aligned_states
+                    # Ensure correct device and dtype to match the MLP
+                    aligned_states = aligned_states.to(self.primary_device)
+                    target_dtype = self.acceptance_predictor.mlp[0].weight.dtype
+                    if aligned_states.dtype != target_dtype:
+                        aligned_states = aligned_states.to(dtype=target_dtype)
+                    # Predict probabilities in batch and aggregate to path-level
+                    probs = self.acceptance_predictor(aligned_states.unsqueeze(0))  # [1, seq_len]
+                    acceptance_prob = float(probs.mean().item())
                     path.acceptance_prob = acceptance_prob
                     path_probs.append(acceptance_prob)
             else:
@@ -426,11 +420,11 @@ class SpeculativeDecoder:
         if pruning_stats:
             step_stats['pruning_ratio'] = pruning_stats.pruning_ratio
             self.stats['pruning_stats'].append(pruning_stats)
-            
+        
         if not pruned_paths:
             draft_device = self._get_model_device(self.draft_model)
             return torch.tensor([], device=draft_device), step_stats
-            
+        
         # 5. Target model verification with pruned paths
         t0 = time.time()
         accepted_tokens, acceptance_rate = self._verify_with_target(
@@ -454,7 +448,7 @@ class SpeculativeDecoder:
         self.tree_pruner.update_performance(acceptance_rate)
         
         return accepted_tokens.unsqueeze(0), step_stats
-    
+
     def _verify_with_target(
         self,
         input_ids: torch.Tensor,
@@ -472,94 +466,50 @@ class SpeculativeDecoder:
         if not paths:
             draft_device = self._get_model_device(self.draft_model)
             return torch.tensor([], device=draft_device), 0.0
-            
+        
         target_device = self._get_model_device(self.target_model)
         draft_device = self._get_model_device(self.draft_model)
         
-        # Batch all paths together for parallel verification
-        max_path_len = max(len(path.token_ids) for path in paths)
-        batch_size = len(paths)
-        
-        # Create batched input
-        batch_input_ids = []
-        batch_attention_mask = []
-        valid_lengths = []
-        
-        for path in paths:
-            # Construct full sequence
-            path_tokens = torch.tensor(path.token_ids, device=draft_device).unsqueeze(0)  # Add batch dimension
-            candidate_ids = torch.cat([input_ids.to(draft_device), path_tokens], dim=1)
-            
-            # Pad to max length
-            padding_needed = max_path_len - len(path.token_ids)
-            if padding_needed > 0:
-                pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-                candidate_ids = torch.cat([
-                    candidate_ids,
-                    torch.full((1, padding_needed), pad_token_id, device=draft_device)
-                ], dim=1)
-            
-            batch_input_ids.append(candidate_ids)
-            valid_lengths.append(len(path.token_ids))
-            
-            # Create attention mask
-            if attention_mask is not None:
-                path_attention = torch.cat([
-                    attention_mask.to(draft_device),
-                    torch.ones(1, len(path.token_ids), device=draft_device),
-                    torch.zeros(1, padding_needed, device=draft_device)
-                ], dim=1)
-            else:
-                path_attention = torch.cat([
-                    torch.ones(1, input_ids.shape[1] + len(path.token_ids), device=draft_device),
-                    torch.zeros(1, padding_needed, device=draft_device)
-                ], dim=1)
-            batch_attention_mask.append(path_attention)
-        
-        # Stack into batch
-        batch_input_ids = torch.cat(batch_input_ids, dim=0).to(target_device)  # [batch_size, seq_len]
-        batch_attention_mask = torch.cat(batch_attention_mask, dim=0).to(target_device)
-        
-        # Single forward pass for all paths
+        # 1) Run base context once to get KV cache
         with torch.no_grad():
-            outputs = self.target_model(
-                input_ids=batch_input_ids[:, :-1],
-                attention_mask=batch_attention_mask[:, :-1],
-                use_cache=False  # Don't use cache for batch processing
+            base_outputs = self.target_model(
+                input_ids=input_ids.to(target_device),
+                attention_mask=(attention_mask.to(target_device) if attention_mask is not None else None),
+                use_cache=True
             )
+        past_kv_base = base_outputs.past_key_values
         
-        # Get logits for all paths
-        all_logits = outputs.logits[:, input_ids.shape[1]-1:, :]  # [batch_size, max_path_len, vocab_size]
-        
-        # Verify each path
+        # 2) Verify each path greedily using the shared base KV cache
         best_path_idx = -1
         max_accepted_length = 0
         
-        for i, (path, valid_len) in enumerate(zip(paths, valid_lengths)):
-            path_logits = all_logits[i, :valid_len, :]  # [path_len, vocab_size]
-            
-            # Verify tokens
+        for i, path in enumerate(paths):
             accepted_length = 0
-            for j, draft_token in enumerate(path.token_ids):
-                if do_sample:
-                    # Sample from target distribution
-                    probs = F.softmax(path_logits[j] / 1.0, dim=-1)
-                    target_token = torch.multinomial(probs, 1).item()
-                else:
-                    # Greedy decoding
-                    target_token = torch.argmax(path_logits[j]).item()
+            past_kv = past_kv_base
+            
+            # Greedy verification is required for speculative decoding
+            for draft_token in path.token_ids:
+                token_tensor = torch.tensor([[draft_token]], device=target_device)
+                with torch.no_grad():
+                    out = self.target_model(
+                        input_ids=token_tensor,
+                        past_key_values=past_kv,
+                        use_cache=True
+                    )
+                logits = out.logits[0, -1, :]
+                target_token = torch.argmax(logits).item()
+                past_kv = out.past_key_values
                 
                 if target_token == draft_token:
                     accepted_length += 1
                 else:
                     break
             
-            # Track best path
             if accepted_length > max_accepted_length:
                 max_accepted_length = accepted_length
                 best_path_idx = i
         
-        # Return accepted tokens
+        # 3) Return the best accepted prefix
         if best_path_idx >= 0 and max_accepted_length > 0:
             best_path = paths[best_path_idx]
             accepted_tokens = torch.tensor(
@@ -570,7 +520,7 @@ class SpeculativeDecoder:
         else:
             accepted_tokens = torch.tensor([], device=draft_device)
             acceptance_rate = 0.0
-            
+        
         return accepted_tokens, acceptance_rate
     
     def _generate_single_token(
