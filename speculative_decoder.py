@@ -19,8 +19,8 @@ import time
 from tqdm import tqdm
 import numpy as np
 
-from .config import SpeculativeDecodingConfig
-from .models import (
+from config import SpeculativeDecodingConfig
+from models import (
     AffineAlignment,
     DraftTreeSearch, 
     AcceptanceProbabilityPredictor,
