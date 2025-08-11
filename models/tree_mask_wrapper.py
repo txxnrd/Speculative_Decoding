@@ -32,10 +32,20 @@ class TreeMaskModelWrapper(nn.Module):
         self._custom_attn_mask = None
         
         def create_attention_hook(layer_idx):
-            def attention_forward_hook(module, args, kwargs):
+            def attention_forward_hook(module, args):
+                # PyTorch pre-forward hooks receive (module, args) tuple
+                # We need to modify args which may contain kwargs
+                # Unpack args - it might be (args, kwargs) or just args
+                if len(args) == 2 and isinstance(args[1], dict):
+                    # New style: (args_tuple, kwargs_dict)
+                    args_tuple, kwargs = args
+                else:
+                    # Old style: just args_tuple
+                    args_tuple = args
+                    kwargs = {}
+                
                 # Check if we have a custom mask to inject
                 if self._custom_attn_mask is not None:
-                    # Different models have different attention interfaces
                     # Try to inject the mask appropriately
                     if 'attention_mask' in kwargs:
                         # Replace or combine with existing mask
@@ -45,27 +55,43 @@ class TreeMaskModelWrapper(nn.Module):
                         else:
                             # Use our custom mask
                             kwargs['attention_mask'] = self._custom_attn_mask
-                    elif len(args) > 1 and args[1] is not None:
+                    elif len(args_tuple) > 1 and args_tuple[1] is not None:
                         # Attention mask might be positional arg
-                        args = list(args)
-                        if args[1].dim() == 4:
-                            args[1] = args[1] + self._custom_attn_mask
-                        else:
-                            args[1] = self._custom_attn_mask
-                        args = tuple(args)
-                        
-                return args, kwargs
+                        args_list = list(args_tuple)
+                        if isinstance(args_list[1], torch.Tensor):
+                            if args_list[1].dim() == 4:
+                                args_list[1] = args_list[1] + self._custom_attn_mask
+                            else:
+                                args_list[1] = self._custom_attn_mask
+                        args_tuple = tuple(args_list)
+                
+                # Return modified args in the format expected
+                if kwargs:
+                    return (args_tuple, kwargs)
+                else:
+                    return args_tuple
                 
             return attention_forward_hook
         
         # Find attention modules and register hooks
+        registered_count = 0
         for name, module in self.model.named_modules():
-            # Common attention module names across different models
-            if any(attn_name in name.lower() for attn_name in ['attention', 'self_attn', 'attn']):
-                if hasattr(module, 'forward'):
+            # Look for LlamaAttention or similar attention modules specifically
+            if ('attention' in name.lower() or 'self_attn' in name.lower()) and hasattr(module, 'forward'):
+                # Skip projection layers and other non-attention modules
+                if any(skip in name.lower() for skip in ['_proj', 'mlp', 'layer_norm', 'embed']):
+                    continue
+                # Only hook actual attention modules (check for q_proj as indicator)
+                if hasattr(module, 'q_proj') or hasattr(module, 'query') or 'attention' in module.__class__.__name__.lower():
                     # Register pre-forward hook
                     module._forward_pre_hooks.clear()  # Clear existing hooks to avoid conflicts
                     module.register_forward_pre_hook(create_attention_hook(name))
+                    registered_count += 1
+        
+        if registered_count == 0:
+            warnings.warn(f"No attention modules found to hook in {self.model.__class__.__name__}. Tree mask may not be applied.")
+        else:
+            print(f"✓ Registered tree mask hooks on {registered_count} attention modules")
                     
     def forward(
         self,

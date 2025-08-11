@@ -574,28 +574,82 @@ class SpeculativeDecoder:
         
         # 4) Single forward pass with tree mask
         # Note: Most HF models don't support 4D attention masks directly.
-        # We'll try to use it, but may need model-specific handling.
+        # We'll convert our tree mask to a 2D attention mask that encodes the tree structure
         with torch.no_grad():
-            # Check if model is wrapped with TreeMaskModelWrapper
-            if hasattr(self.target_model, 'tree_attention_mask'):
+            # Convert 4D tree mask to 2D mask compatible with HF models
+            # HF expects 0 for attend, 1 for mask (opposite of our convention)
+            # Also, HF uses additive masks with large negative values
+            
+            # Create 2D attention mask from our tree structure
+            # Shape: [batch_size, seq_len]
+            tree_mask_2d = torch.zeros((1, total_len), device=target_device)
+            
+            # For causal mask with tree structure, we need to create a custom attention mask
+            # that HF models can process. We'll use the approach of creating a full attention
+            # matrix and then converting it.
+            # Create a full attention matrix [seq_len, seq_len]
+            full_attn_mask = torch.zeros((total_len, total_len), device=target_device)
+            
+            # Fill in the attention pattern
+            # Base context can attend to itself causally
+            for i in range(base_len):
+                full_attn_mask[i, i+1:base_len] = 1  # mask future tokens in base
+                
+            # Tree nodes can only see their ancestors and base
+            for i in range(tree_size):
+                tree_pos = base_len + i
+                # Block everything first
+                full_attn_mask[tree_pos, :] = 1
+                # Allow base context
+                full_attn_mask[tree_pos, :base_len] = 0
+                # Allow self
+                full_attn_mask[tree_pos, tree_pos] = 0
+                
+                # Trace ancestors and allow
+                current_idx = i
+                while flat_parent_indices[current_idx] >= 0:
+                    parent_idx = flat_parent_indices[current_idx]
+                    parent_pos = base_len + parent_idx
+                    full_attn_mask[tree_pos, parent_pos] = 0
+                    current_idx = parent_idx
+            
+            # Convert to HF format: 1 -> -10000, 0 -> 0
+            full_attn_mask = full_attn_mask * -10000.0
+            full_attn_mask = full_attn_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq, seq]
+            
+            # For models that support it, we can try to pass the 4D mask directly
+            # Otherwise, we'll rely on the model to expand the 2D mask appropriately
+            use_tree_wrapper = isinstance(self.target_model, TreeMaskModelWrapper)
+            
+            if use_tree_wrapper:
                 # Use our custom wrapper that supports tree masks
                 outputs = self.target_model(
                     input_ids=combined_input_ids,
                     attention_mask=basic_attention_mask,
                     position_ids=combined_position_ids,
-                    tree_attention_mask=attn_mask,
+                    tree_attention_mask=full_attn_mask,  # Use converted mask
                     use_cache=False,
                     output_attentions=False,
                 )
             else:
-                # Try standard forward (won't have tree structure but at least runs)
-                print("Warning: Target model not wrapped with TreeMaskModelWrapper. Tree mask not applied.")
-                outputs = self.target_model(
-                    input_ids=combined_input_ids,
-                    attention_mask=basic_attention_mask,
-                    position_ids=combined_position_ids,
-                    use_cache=False,
-                )
+                # For standard models, we can try to pass attention_mask as 4D
+                # Some models like GPT2 accept this format
+                print("Warning: Target model not wrapped with TreeMaskModelWrapper. Attempting direct 4D mask.")
+                try:
+                    outputs = self.target_model(
+                        input_ids=combined_input_ids,
+                        attention_mask=full_attn_mask,  # Try 4D mask directly
+                        position_ids=combined_position_ids,
+                        use_cache=False,
+                    )
+                except Exception as e:
+                    print(f"4D mask failed ({e}), falling back to standard 2D mask (tree structure lost)")
+                    outputs = self.target_model(
+                        input_ids=combined_input_ids,
+                        attention_mask=basic_attention_mask,
+                        position_ids=combined_position_ids,
+                        use_cache=False,
+                    )
         
         # 5) Extract logits for tree nodes
         all_logits = outputs.logits[0, base_len-1:base_len-1+tree_size, :]  # [tree_size, vocab]
