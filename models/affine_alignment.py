@@ -82,6 +82,8 @@ class AffineAlignment(nn.Module):
             target_hidden_states: 변환된 hidden states
         """
         original_shape = draft_hidden_states.shape
+        original_dtype = draft_hidden_states.dtype
+        original_device = draft_hidden_states.device
         
         # Handle multi-candidate case
         if len(original_shape) == 4:
@@ -90,6 +92,10 @@ class AffineAlignment(nn.Module):
             draft_hidden_states = rearrange(
                 draft_hidden_states, 'b c s h -> (b c) s h'
             )
+        
+        # Ensure same dtype as model weights (handle float16/float32 mismatch)
+        if draft_hidden_states.dtype != self.weight.dtype:
+            draft_hidden_states = draft_hidden_states.to(dtype=self.weight.dtype)
         
         # Affine transformation
         target_hidden_states = F.linear(
@@ -104,6 +110,12 @@ class AffineAlignment(nn.Module):
         
         # Layer normalization
         target_hidden_states = self.layer_norm(target_hidden_states)
+        
+        # Convert back to original dtype if needed
+        if target_hidden_states.dtype != original_dtype:
+            target_hidden_states = target_hidden_states.to(dtype=original_dtype)
+            if return_raw:
+                raw_states = raw_states.to(dtype=original_dtype)
         
         # Restore original shape if needed
         if len(original_shape) == 4:
@@ -141,6 +153,10 @@ class AffineAlignment(nn.Module):
             loss: MSE loss
         """
         predicted_states = self.forward(draft_hidden_states)
+        
+        # Ensure same dtype for loss computation
+        if predicted_states.dtype != target_hidden_states.dtype:
+            predicted_states = predicted_states.to(dtype=target_hidden_states.dtype)
         
         if mask is not None:
             # Apply mask
@@ -192,6 +208,10 @@ class AffineAlignment(nn.Module):
             dict: 다양한 alignment 메트릭들
         """
         predicted_states = self.forward(draft_hidden_states)
+        
+        # Ensure same dtype
+        if predicted_states.dtype != target_hidden_states.dtype:
+            predicted_states = predicted_states.to(dtype=target_hidden_states.dtype)
         
         # MSE
         mse = F.mse_loss(predicted_states, target_hidden_states).item()

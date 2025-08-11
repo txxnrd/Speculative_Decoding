@@ -88,7 +88,7 @@ class SpeculativeDecoder:
             hidden_size_target=config.affine_alignment.hidden_size_target,
             use_bias=config.affine_alignment.use_bias,
             dropout_rate=config.affine_alignment.dropout_rate
-        ).to(self.primary_device)
+        ).to(self.primary_device).to(config.model.dtype)  # Match model dtype
         
         self.acceptance_predictor = AcceptanceProbabilityPredictor(
             input_dim=config.affine_alignment.hidden_size_target,
@@ -96,7 +96,7 @@ class SpeculativeDecoder:
             activation=config.mlp.activation,
             dropout_rate=config.mlp.dropout_rate,
             use_layer_norm=config.mlp.use_layer_norm
-        ).to(self.primary_device)
+        ).to(self.primary_device).to(config.model.dtype)  # Match model dtype
         
         self.tree_search = DraftTreeSearch(
             draft_model=self.draft_model,
