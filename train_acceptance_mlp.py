@@ -31,13 +31,6 @@ class AcceptanceDataset(Dataset):
     def __init__(self, data_path: str):
         with open(data_path, 'r') as f:
             self.data = json.load(f)
-        
-        # Debug first item
-        if len(self.data) > 0:
-            first_item = self.data[0]
-            print(f"Dataset debug - First item:")
-            print(f"  aligned_hidden_state length: {len(first_item['aligned_hidden_state'])}")
-            print(f"  accepted value: {first_item['accepted']}")
     
     def __len__(self):
         return len(self.data)
@@ -46,13 +39,6 @@ class AcceptanceDataset(Dataset):
         item = self.data[idx]
         aligned_hidden = torch.tensor(item['aligned_hidden_state'], dtype=torch.float32)
         accepted = torch.tensor(item['accepted'], dtype=torch.float32)
-        
-        # Debug shape on first call
-        if idx == 0:
-            print(f"Dataset __getitem__ debug:")
-            print(f"  aligned_hidden shape: {aligned_hidden.shape}")
-            print(f"  accepted shape: {accepted.shape}")
-            
         return aligned_hidden, accepted
 
 
@@ -78,8 +64,7 @@ class SimpleMLP(nn.Module):
     def forward(self, x):
         # x shape: [batch_size, input_dim]
         output = self.mlp(x)  # [batch_size, 1]
-        # Ensure we return [batch_size] shape
-        return output.view(-1)  # Use view instead of squeeze for consistency
+        return output.squeeze(1)  # [batch_size]
 
 
 def collect_training_data(
@@ -193,18 +178,9 @@ def train_mlp(
         mlp.train()
         train_losses = []
         
-        for i, (aligned_hidden, accepted) in enumerate(tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}")):
+        for aligned_hidden, accepted in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
             aligned_hidden = aligned_hidden.to(device)
             accepted = accepted.to(device)
-            
-            # Debug shapes on first batch of first epoch
-            if epoch == 0 and i == 0:
-                print(f"\nDebug - First batch shapes:")
-                print(f"  Input shape: {aligned_hidden.shape}")
-                test_output = mlp(aligned_hidden)
-                print(f"  MLP output shape: {test_output.shape}")
-                print(f"  Target shape: {accepted.shape}")
-                print()
             
             optimizer.zero_grad()
             predictions = mlp(aligned_hidden)  # Raw logits

@@ -46,7 +46,7 @@ def main():
     config.tree_search.max_depth = 4
     config.tree_search.temperature = 0.8
     
-    # Pruning 설정
+    # Pruning 설정 - 이제 학습된 MLP가 있으므로 활성화
     config.pruning.min_acceptance_prob = 0.1
     config.pruning.pruning_ratio = 0.5
     
@@ -56,6 +56,14 @@ def main():
     print(f"Target model: {config.model.target_model_name}")
     
     decoder = SpeculativeDecoder(config)
+    
+    # Load trained acceptance MLP
+    mlp_path = "/home/taeyun/Speculative_Decoding/best_acceptance_mlp.pt"
+    if os.path.exists(mlp_path):
+        decoder.load_acceptance_mlp(mlp_path)
+        print("✓ Loaded trained acceptance MLP")
+    else:
+        print("⚠ Warning: No trained acceptance MLP found, using random initialization")
     
     # 3. 텍스트 생성 예시
     prompt = "The future of artificial intelligence is"

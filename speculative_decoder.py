@@ -156,39 +156,56 @@ class SpeculativeDecoder:
                 self.affine_alignment.bias.data = b
             print(f"✓ Loaded affine alignment weights: W={W.shape}, b={b.shape}")
         
-        # Load MLP weights for acceptance predictor
-        if 'mlp' in checkpoint:
-            mlp_state_dict = checkpoint['mlp']
+        # Don't load MLP from affine checkpoint - use separately trained one
+        print("Pre-trained affine weights loaded successfully!")
+    
+    def load_acceptance_mlp(self, mlp_checkpoint_path: str):
+        """
+        Load separately trained acceptance probability predictor MLP
+        
+        Args:
+            mlp_checkpoint_path: Path to the trained MLP checkpoint
+        """
+        print(f"Loading acceptance MLP from {mlp_checkpoint_path}")
+        mlp_checkpoint = torch.load(mlp_checkpoint_path, map_location='cpu')
+        
+        if 'model_state_dict' in mlp_checkpoint:
+            # Load the state dict
+            state_dict = mlp_checkpoint['model_state_dict']
             
-            # Map the loaded weights to our MLP structure
-            # The checkpoint has layers 0, 2, 4 (Linear layers)
+            # Create a mapping for our acceptance predictor structure
+            # The trained model has a simple structure without LayerNorm/Dropout
             our_state_dict = self.acceptance_predictor.state_dict()
             
-            # Create mapping from checkpoint to our model
+            # Map the weights - assuming the trained MLP has structure:
+            # Linear(8192->256) -> ReLU -> Linear(256->128) -> ReLU -> Linear(128->1)
             layer_mapping = {
-                '0.weight': 'mlp.0.weight',    # First linear layer
-                '0.bias': 'mlp.0.bias',
-                '2.weight': 'mlp.3.weight',    # Second linear layer (after LayerNorm, Activation, Dropout)
-                '2.bias': 'mlp.3.bias',
-                '4.weight': 'mlp.6.weight',    # Final linear layer
-                '4.bias': 'mlp.6.bias'
+                'mlp.0.weight': 'mlp.0.weight',    # First linear
+                'mlp.0.bias': 'mlp.0.bias',
+                'mlp.2.weight': 'mlp.3.weight',    # Second linear (after ReLU, LayerNorm, Dropout)
+                'mlp.2.bias': 'mlp.3.bias',
+                'mlp.4.weight': 'mlp.6.weight',    # Final linear
+                'mlp.4.bias': 'mlp.6.bias'
             }
             
-            # Update our state dict with loaded weights
-            for ckpt_key, our_key in layer_mapping.items():
-                if ckpt_key in mlp_state_dict and our_key in our_state_dict:
-                    # Convert to appropriate dtype and device
-                    weight = mlp_state_dict[ckpt_key].to(
+            # Update our state dict
+            for src_key, dst_key in layer_mapping.items():
+                if src_key in state_dict and dst_key in our_state_dict:
+                    weight = state_dict[src_key].to(
                         dtype=self.config.model.dtype,
                         device=self.primary_device
                     )
-                    our_state_dict[our_key] = weight
+                    our_state_dict[dst_key] = weight
             
-            # Load the updated state dict
+            # Load updated state dict
             self.acceptance_predictor.load_state_dict(our_state_dict, strict=False)
-            print("✓ Loaded MLP weights for acceptance predictor")
             
-        print("Pre-trained weights loaded successfully!")
+            if 'val_acc' in mlp_checkpoint:
+                print(f"✓ Loaded MLP with validation accuracy: {mlp_checkpoint['val_acc']:.4f}")
+            else:
+                print("✓ Loaded MLP weights successfully")
+                
+        print("Acceptance MLP loaded successfully!")
         
     def _get_model_device(self, model):
         """Get the primary device of a model (for multi-GPU models)"""
