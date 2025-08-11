@@ -382,34 +382,85 @@ class SpeculativeDecoder:
             
         # 2. Affine alignment - handle device transfer
         t0 = time.time()
+        # Batch process all paths at once
+        all_hidden_states = []
+        path_lengths = []
+        paths_with_hidden = []
+        
         for path in tree_paths:
             if path.hidden_states is not None:
-                # Move hidden states to alignment device
-                hidden_states_aligned = path.hidden_states.to(self.primary_device)
-                aligned_states = self.affine_alignment(hidden_states_aligned.unsqueeze(0))
-                path.aligned_states = aligned_states
+                all_hidden_states.append(path.hidden_states)
+                path_lengths.append(path.hidden_states.shape[0])
+                paths_with_hidden.append(path)
+        
+        if all_hidden_states:
+            # Get draft device and dtype - use these throughout
+            draft_device = self._get_model_device(self.draft_model)
+            draft_dtype = next(self.draft_model.parameters()).dtype
+            
+            # Ensure affine/mlp are on draft device/dtype for efficiency
+            if self.affine_alignment.weight.device != draft_device:
+                self.affine_alignment = self.affine_alignment.to(draft_device)
+            if self.acceptance_predictor.mlp[0].weight.device != draft_device:
+                self.acceptance_predictor = self.acceptance_predictor.to(draft_device)
+            
+            # Pad sequences to same length for batching
+            max_len = max(path_lengths)
+            padded_states = []
+            for hidden in all_hidden_states:
+                seq_len = hidden.shape[0]
+                if seq_len < max_len:
+                    padding = torch.zeros(max_len - seq_len, hidden.shape[1], 
+                                        device=hidden.device, dtype=hidden.dtype)
+                    padded = torch.cat([hidden, padding], dim=0)
+                else:
+                    padded = hidden
+                padded_states.append(padded)
+            
+            # Stack into batch [B, L, H]
+            batch_hidden = torch.stack(padded_states, dim=0)
+            
+            # Batch affine transformation
+            batch_aligned = self.affine_alignment(batch_hidden)  # [B, L, H_target]
+            
+            # Store aligned states back to paths
+            for i, (path, length) in enumerate(zip(paths_with_hidden, path_lengths)):
+                path.aligned_states = batch_aligned[i, :length]  # Trim padding
+        
         self.stats['timing']['alignment'] += time.time() - t0
         
-        # 3. Acceptance probability prediction
+        # 3. Acceptance probability prediction - now batched
         t0 = time.time()
         path_probs = []
-        for path in tree_paths:
-            if path.aligned_states is not None:
+        
+        if paths_with_hidden:
+            # Collect all aligned states
+            all_aligned = []
+            for path in paths_with_hidden:
+                if path.aligned_states is not None:
+                    all_aligned.append(path.aligned_states)
+            
+            if all_aligned:
+                # Flatten all sequences for MLP: [total_tokens, H]
+                flat_aligned = torch.cat(all_aligned, dim=0)
+                
+                # Batch MLP forward
                 with torch.no_grad():
-                    # aligned_states shape: [1, seq_len, hidden_size]
-                    aligned_states = path.aligned_states
-                    # Ensure correct device and dtype to match the MLP
-                    aligned_states = aligned_states.to(self.primary_device)
-                    target_dtype = self.acceptance_predictor.mlp[0].weight.dtype
-                    if aligned_states.dtype != target_dtype:
-                        aligned_states = aligned_states.to(dtype=target_dtype)
-                    # Predict probabilities in batch and aggregate to path-level
-                    probs = self.acceptance_predictor(aligned_states.unsqueeze(0))  # [1, seq_len]
-                    acceptance_prob = float(probs.mean().item())
-                    path.acceptance_prob = acceptance_prob
-                    path_probs.append(acceptance_prob)
-            else:
-                # Fallback normalization logic
+                    flat_probs = self.acceptance_predictor(flat_aligned)  # [total_tokens]
+                
+                # Redistribute probabilities back to paths
+                offset = 0
+                for path in paths_with_hidden:
+                    length = path.aligned_states.shape[0]
+                    path_prob_values = flat_probs[offset:offset+length]
+                    # Use geometric mean instead of arithmetic mean for length-invariance
+                    path.acceptance_prob = float(torch.exp(torch.log(path_prob_values + 1e-8).mean()).item())
+                    path_probs.append(path.acceptance_prob)
+        
+        # Handle paths without hidden states
+        for path in tree_paths:
+            if path not in paths_with_hidden:
+                # Fallback normalization
                 if len(tree_paths) > 1:
                     min_score = min(p.cumulative_score for p in tree_paths)
                     max_score = max(p.cumulative_score for p in tree_paths)
@@ -527,44 +578,60 @@ class SpeculativeDecoder:
         if not flat_token_ids:
             return torch.tensor([], device=draft_device), 0.0
         
-        # 2) Construct tree-structured attention mask
+        # 2) Construct tree-structured attention mask - vectorized
         # Each node can only attend to: (1) base context, (2) its ancestors
         tree_size = len(flat_token_ids)
         total_len = base_len + tree_size
         
-        # Create attention mask [1, 1, total_len, total_len]
-        # Using additive mask where -inf blocks attention
-        attn_mask = torch.full((1, 1, total_len, total_len), float('-inf'), device=target_device)
+        # Vectorized mask construction
+        # Create attention mask [1, 1, total_len, total_len] 
+        attn_mask = torch.zeros((total_len, total_len), device=target_device)
         
-        # Allow all positions to see base context
-        attn_mask[:, :, :, :base_len] = 0.0
+        # Base context: causal mask
+        base_indices = torch.arange(base_len, device=target_device)
+        attn_mask[:base_len, :base_len] = torch.triu(torch.ones(base_len, base_len, device=target_device), diagonal=1)
         
-        # Allow base context to see itself (causal)
-        for i in range(base_len):
-            for j in range(i + 1):
-                attn_mask[0, 0, i, j] = 0.0
-        
-        # For tree nodes: trace ancestors and allow attention
-        for i, parent_idx in enumerate(flat_parent_indices):
-            tree_pos = base_len + i
-            # Can attend to self
-            attn_mask[0, 0, tree_pos, tree_pos] = 0.0
+        # Tree nodes setup
+        if tree_size > 0:
+            # Convert parent indices to tensor for vectorized ops
+            parent_indices_tensor = torch.tensor(flat_parent_indices, device=target_device, dtype=torch.long)
             
-            # Trace back to root through parent indices
-            current_parent = parent_idx
-            while current_parent >= 0:
-                parent_tree_pos = base_len + current_parent
-                attn_mask[0, 0, tree_pos, parent_tree_pos] = 0.0
-                # Get parent of parent
-                current_parent = flat_parent_indices[current_parent]
+            # Build ancestor matrix efficiently
+            # ancestors[i,j] = 1 if j is ancestor of i
+            ancestors = torch.zeros((tree_size, tree_size), device=target_device, dtype=torch.bool)
+            
+            # Each node can see itself
+            ancestors.fill_diagonal_(True)
+            
+            # Propagate ancestor relationships
+            for i in range(tree_size):
+                if parent_indices_tensor[i] >= 0:
+                    # Node i can see its parent
+                    ancestors[i, parent_indices_tensor[i]] = True
+                    # Node i can see all ancestors of its parent
+                    if parent_indices_tensor[i] < i:  # Parent was processed before
+                        ancestors[i] = ancestors[i] | ancestors[parent_indices_tensor[i]]
+            
+            # Set tree part of attention mask
+            # Tree nodes can't see each other unless ancestor relationship
+            attn_mask[base_len:, base_len:] = ~ancestors.float()
+            
+            # Tree nodes can see all base context (already 0)
+            # Base context can't see tree nodes
+            attn_mask[:base_len, base_len:] = 1.0
         
-        # 3) Prepare inputs
+        # Convert to HF format: 1 -> -10000, 0 -> 0
+        attn_mask = attn_mask * -10000.0
+        attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # [1, 1, seq, seq]
+        
+        # 3) Prepare inputs with better position IDs
         flat_tokens_tensor = torch.tensor(flat_token_ids, device=target_device).unsqueeze(0)
         combined_input_ids = torch.cat([input_ids.to(target_device), flat_tokens_tensor], dim=1)
         
-        # Position IDs
+        # Position IDs: avoid collisions by using unique positions for each node
+        # Strategy: base positions as-is, then tree nodes get sequential positions
         base_positions = torch.arange(base_len, device=target_device)
-        tree_positions = torch.tensor(flat_position_ids, device=target_device)
+        tree_positions = torch.arange(base_len, base_len + tree_size, device=target_device)
         combined_position_ids = torch.cat([base_positions, tree_positions]).unsqueeze(0)
         
         # Basic attention mask for padding (all 1s since no padding)
@@ -652,7 +719,9 @@ class SpeculativeDecoder:
                     )
         
         # 5) Extract logits for tree nodes
-        all_logits = outputs.logits[0, base_len-1:base_len-1+tree_size, :]  # [tree_size, vocab]
+        # For teacher-forced generation, logits at position i predict token i+1
+        # So for tree nodes starting at base_len, we need logits from base_len-1
+        all_logits = outputs.logits[0, base_len:base_len+tree_size, :]  # [tree_size, vocab]
         
         # 6) Verify each path
         best_path_idx = -1

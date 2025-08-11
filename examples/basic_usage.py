@@ -41,15 +41,15 @@ def main():
     # MLP 설정 (checkpoint와 일치하도록)
     config.mlp.hidden_dims = [256, 128]  # checkpoint의 실제 MLP 구조: 8192 -> 256 -> 128 -> 1
     
-    # Tree search 파라미터
-    config.tree_search.max_candidates = 3
-    config.tree_search.max_depth = 4
-    config.tree_search.temperature = 0.8
+    # Tree search 파라미터 - 보수적으로 축소
+    config.tree_search.max_candidates = 2  # 3->2: 분기 수 감소
+    config.tree_search.max_depth = 2      # 4->2: 깊이 대폭 축소
+    config.tree_search.temperature = 0.3   # 0.8->0.3: 더 확실한 토큰만 선택
     
-    # Pruning 설정 - 이제 학습된 MLP가 있으므로 활성화
-    config.pruning.min_acceptance_prob = 0.1
-    config.pruning.pruning_ratio = 0.5
-    config.pruning.top_k_paths = 4
+    # Pruning 설정 - 더 공격적으로
+    config.pruning.min_acceptance_prob = 0.3  # 0.1->0.3: 낮은 확률 경로 조기 제거
+    config.pruning.pruning_ratio = 0.7       # 0.5->0.7: 더 많이 가지치기
+    config.pruning.top_k_paths = 2           # 4->2: 검증할 경로 수 축소
     config.profile = True
     
     # 2. Speculative Decoder 초기화
