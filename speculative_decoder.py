@@ -13,19 +13,20 @@ Affine Alignment based Speculative Decoder
 
 import torch
 import torch.nn.functional as F
-from typing import List, Dict, Optional, Tuple, Union
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from torch import nn
+from typing import Optional, Dict, List, Tuple, Union
 import time
+from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
-import numpy as np
+from collections import defaultdict
+import warnings
 
+# Import internal modules
 from config import SpeculativeDecodingConfig
-from models import (
-    AffineAlignment,
-    DraftTreeSearch, 
-    AcceptanceProbabilityPredictor,
-    TreePruner
-)
+from models import AffineAlignment, DraftTreeSearch, AcceptanceProbabilityPredictor, TreePruner
+from models.draft_tree_search import TreePath  # Add TreePath import
+
+warnings.filterwarnings("ignore")
 
 
 class SpeculativeDecoder:
