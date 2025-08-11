@@ -372,20 +372,23 @@ class SpeculativeDecoder:
         path_probs = []
         for path in tree_paths:
             if path.aligned_states is not None:
-                # Use MLP to predict acceptance probability
                 with torch.no_grad():
+                    token_probs = []
                     # aligned_states shape: [1, seq_len, hidden_size]
-                    # Take mean over sequence dimension for path-level prediction
-                    path_features = path.aligned_states.mean(dim=1)  # [1, hidden_size]
-                    
-                    # Get prediction from MLP
-                    acceptance_logit = self.acceptance_predictor(path_features)
-                    acceptance_prob = torch.sigmoid(acceptance_logit).item()
-                    
+                    for token_idx in range(path.aligned_states.shape[1]):
+                        token_feat = path.aligned_states[0, token_idx].to(self.primary_device).float()  # [hidden_size]
+                        prob_logit = self.acceptance_predictor(token_feat.unsqueeze(0))  # [1]
+                        prob = torch.sigmoid(prob_logit).item()
+                        token_probs.append(prob)
+                    # Aggregate token probs to path-level probability (mean)
+                    if token_probs:
+                        acceptance_prob = float(np.mean(token_probs))
+                    else:
+                        acceptance_prob = 0.0
                     path.acceptance_prob = acceptance_prob
                     path_probs.append(acceptance_prob)
             else:
-                # Fallback: use normalized cumulative score
+                # Fallback normalization logic
                 if len(tree_paths) > 1:
                     min_score = min(p.cumulative_score for p in tree_paths)
                     max_score = max(p.cumulative_score for p in tree_paths)
@@ -396,7 +399,6 @@ class SpeculativeDecoder:
                         normalized_score = 0.5
                 else:
                     normalized_score = 0.5
-                
                 path.acceptance_prob = normalized_score
                 path_probs.append(normalized_score)
         
