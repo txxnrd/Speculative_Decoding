@@ -273,11 +273,11 @@ class DraftTreeSearch:
                         token_ids = [node.token_id for node in path_nodes]
                         
                         if return_hidden_states:
-                            # Collect hidden states and ensure they're on CPU to save GPU memory
+                            # Collect hidden states
                             hidden_states_list = []
                             for node in path_nodes:
                                 if node.hidden_state is not None:
-                                    hidden_states_list.append(node.hidden_state.cpu())
+                                    hidden_states_list.append(node.hidden_state)
                             
                             if hidden_states_list:
                                 hidden_states = torch.stack(hidden_states_list)

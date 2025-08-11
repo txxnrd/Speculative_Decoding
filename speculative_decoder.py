@@ -146,9 +146,9 @@ class SpeculativeDecoder:
         
         # Load affine alignment weights
         if 'W' in checkpoint and 'b' in checkpoint:
-            # Convert to appropriate dtype
-            W = checkpoint['W'].to(dtype=self.config.model.dtype)
-            b = checkpoint['b'].to(dtype=self.config.model.dtype)
+            # Convert to appropriate dtype and device
+            W = checkpoint['W'].to(dtype=self.config.model.dtype, device=self.primary_device)
+            b = checkpoint['b'].to(dtype=self.config.model.dtype, device=self.primary_device)
             
             # Assign to affine alignment module
             self.affine_alignment.weight.data = W
@@ -177,8 +177,11 @@ class SpeculativeDecoder:
             # Update our state dict with loaded weights
             for ckpt_key, our_key in layer_mapping.items():
                 if ckpt_key in mlp_state_dict and our_key in our_state_dict:
-                    # Convert to appropriate dtype
-                    weight = mlp_state_dict[ckpt_key].to(dtype=self.config.model.dtype)
+                    # Convert to appropriate dtype and device
+                    weight = mlp_state_dict[ckpt_key].to(
+                        dtype=self.config.model.dtype,
+                        device=self.primary_device
+                    )
                     our_state_dict[our_key] = weight
             
             # Load the updated state dict
