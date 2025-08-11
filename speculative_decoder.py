@@ -34,7 +34,7 @@ except Exception:
 
 # Import internal modules
 from config import SpeculativeDecodingConfig
-from models import AffineAlignment, DraftTreeSearch, AcceptanceProbabilityPredictor, TreePruner
+from models import AffineAlignment, DraftTreeSearch, AcceptanceProbabilityPredictor, TreePruner, TreeMaskModelWrapper
 from models.draft_tree_search import TreePath  # Add TreePath import
 
 warnings.filterwarnings("ignore")
@@ -77,14 +77,22 @@ class SpeculativeDecoder:
             
         if target_model is None:
             print(f"Loading target model: {config.model.target_model_name}")
-            self.target_model = AutoModelForCausalLM.from_pretrained(
+            base_model = AutoModelForCausalLM.from_pretrained(
                 config.model.target_model_name,
                 torch_dtype=config.model.dtype,
                 device_map="auto",  # Automatic multi-GPU distribution
                 trust_remote_code=True
             )
+            # Wrap with TreeMaskModelWrapper for 4D attention mask support
+            self.target_model = TreeMaskModelWrapper(base_model)
+            print("✓ Target model wrapped with TreeMaskModelWrapper for tree attention support")
         else:
-            self.target_model = target_model
+            # Wrap provided model if not already wrapped
+            if not isinstance(target_model, TreeMaskModelWrapper):
+                self.target_model = TreeMaskModelWrapper(target_model)
+                print("✓ Wrapped provided target model with TreeMaskModelWrapper")
+            else:
+                self.target_model = target_model
             
         if tokenizer is None:
             self.tokenizer = AutoTokenizer.from_pretrained(
@@ -119,7 +127,8 @@ class SpeculativeDecoder:
             top_k=config.tree_search.top_k,
             top_p=config.tree_search.top_p,
             device=self.device,  # Will handle multi-GPU internally
-            do_sample=False
+            do_sample=False,
+            max_paths_per_level=config.tree_search.max_paths_per_level
         )
         
         self.tree_pruner = TreePruner(
@@ -471,7 +480,8 @@ class SpeculativeDecoder:
         do_sample: bool = True
     ) -> Tuple[torch.Tensor, float]:
         """
-        타겟 모델로 드래프트 경로들을 배치로 한 번에 검증 (teacher forcing + greedy 비교)
+        트리-마스크 방식 검증: 트리를 한 시퀀스로 펼치고, 각 노드가 자기 조상만 볼 수 있게
+        attention mask를 구성한 후, 타겟 모델 1회 전방패스로 모든 노드의 로짓을 획득.
         """
         if not paths:
             draft_device = self._get_model_device(self.draft_model)
@@ -480,173 +490,156 @@ class SpeculativeDecoder:
         target_device = self._get_model_device(self.target_model)
         draft_device = self._get_model_device(self.draft_model)
 
-        # Cap number of paths to verify for speed
-        max_verify = 8
-        if len(paths) > max_verify:
-            paths = sorted(
-                paths,
-                key=lambda p: (
-                    p.acceptance_prob if p.acceptance_prob is not None else -1.0,
-                    p.cumulative_score,
-                ),
-                reverse=True,
-            )[:max_verify]
-
-        # Build batched sequences: base input + full path tokens (padded to max)
+        # 1) Flatten tree: collect all unique nodes in topological order
+        # Build node -> flat_idx mapping
+        visited = {}  # node_id -> flat_idx
+        flat_token_ids = []
+        flat_position_ids = []
+        flat_parent_indices = []  # For mask construction
+        node_to_flat_idx = {}
+        flat_idx = 0
+        
+        # Start with base context length
         base_len = input_ids.shape[1]
-        max_path_len = max(len(p.token_ids) for p in paths)
-
-        batch_input_ids = []
-        batch_attention_mask = []
-        valid_lengths = []
-
-        pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
-
-        for path in paths:
-            path_tokens = torch.tensor(path.token_ids, device=draft_device).unsqueeze(0)  # [1, L]
-            candidate_ids = torch.cat([input_ids.to(draft_device), path_tokens], dim=1)
-            path_len = len(path.token_ids)
-            padding_needed = max_path_len - path_len
-            if padding_needed > 0:
-                pad = torch.full((1, padding_needed), pad_token_id, device=draft_device)
-                candidate_ids = torch.cat([candidate_ids, pad], dim=1)
-            batch_input_ids.append(candidate_ids)
-            valid_lengths.append(path_len)
-
-            if attention_mask is not None:
-                path_attn = torch.cat([
-                    attention_mask.to(draft_device),
-                    torch.ones(1, path_len, device=draft_device),
-                    torch.zeros(1, padding_needed, device=draft_device),
-                ], dim=1)
-            else:
-                path_attn = torch.cat([
-                    torch.ones(1, base_len + path_len, device=draft_device),
-                    torch.zeros(1, padding_needed, device=draft_device),
-                ], dim=1)
-            batch_attention_mask.append(path_attn)
-
-        batch_input_ids = torch.cat(batch_input_ids, dim=0).to(target_device)  # [B, base+maxL]
-        batch_attention_mask = torch.cat(batch_attention_mask, dim=0).to(target_device)
-
-        # Teacher-forced forward for all paths at once (no cache for better throughput on long seq)
+        
+        # Process nodes by depth (BFS style to ensure parents before children)
+        max_depth = max(len(p.token_ids) for p in paths)
+        for depth in range(max_depth):
+            for path in paths:
+                if depth < len(path.nodes):
+                    node = path.nodes[depth]
+                    node_id = id(node)
+                    if node_id not in visited:
+                        visited[node_id] = flat_idx
+                        node_to_flat_idx[node] = flat_idx
+                        flat_token_ids.append(node.token_id)
+                        # Position ID = base_len + depth (all nodes at same depth share position)
+                        flat_position_ids.append(base_len + depth)
+                        # Find parent's flat index
+                        if node.parent and id(node.parent) in visited:
+                            parent_flat_idx = visited[id(node.parent)]
+                            flat_parent_indices.append(parent_flat_idx)
+                        else:
+                            # Root node or first depth - can see all base context
+                            flat_parent_indices.append(-1)
+                        flat_idx += 1
+        
+        if not flat_token_ids:
+            return torch.tensor([], device=draft_device), 0.0
+        
+        # 2) Construct tree-structured attention mask
+        # Each node can only attend to: (1) base context, (2) its ancestors
+        tree_size = len(flat_token_ids)
+        total_len = base_len + tree_size
+        
+        # Create attention mask [1, 1, total_len, total_len]
+        # Using additive mask where -inf blocks attention
+        attn_mask = torch.full((1, 1, total_len, total_len), float('-inf'), device=target_device)
+        
+        # Allow all positions to see base context
+        attn_mask[:, :, :, :base_len] = 0.0
+        
+        # Allow base context to see itself (causal)
+        for i in range(base_len):
+            for j in range(i + 1):
+                attn_mask[0, 0, i, j] = 0.0
+        
+        # For tree nodes: trace ancestors and allow attention
+        for i, parent_idx in enumerate(flat_parent_indices):
+            tree_pos = base_len + i
+            # Can attend to self
+            attn_mask[0, 0, tree_pos, tree_pos] = 0.0
+            
+            # Trace back to root through parent indices
+            current_parent = parent_idx
+            while current_parent >= 0:
+                parent_tree_pos = base_len + current_parent
+                attn_mask[0, 0, tree_pos, parent_tree_pos] = 0.0
+                # Get parent of parent
+                current_parent = flat_parent_indices[current_parent]
+        
+        # 3) Prepare inputs
+        flat_tokens_tensor = torch.tensor(flat_token_ids, device=target_device).unsqueeze(0)
+        combined_input_ids = torch.cat([input_ids.to(target_device), flat_tokens_tensor], dim=1)
+        
+        # Position IDs
+        base_positions = torch.arange(base_len, device=target_device)
+        tree_positions = torch.tensor(flat_position_ids, device=target_device)
+        combined_position_ids = torch.cat([base_positions, tree_positions]).unsqueeze(0)
+        
+        # Basic attention mask for padding (all 1s since no padding)
+        basic_attention_mask = torch.ones(1, total_len, device=target_device)
+        if attention_mask is not None:
+            basic_attention_mask[:, :base_len] = attention_mask.to(target_device)
+        
+        # 4) Single forward pass with tree mask
+        # Note: Most HF models don't support 4D attention masks directly.
+        # We'll try to use it, but may need model-specific handling.
         with torch.no_grad():
-            outputs = self.target_model(
-                input_ids=batch_input_ids[:, :-1],
-                attention_mask=batch_attention_mask[:, :-1],
-                use_cache=False,
-            )
-
-        # Logits for positions where new tokens appear
-        all_logits = outputs.logits[:, base_len - 1 : base_len - 1 + max_path_len, :]
-
-        # Verify each path greedily
+            # Check if model is wrapped with TreeMaskModelWrapper
+            if hasattr(self.target_model, 'tree_attention_mask'):
+                # Use our custom wrapper that supports tree masks
+                outputs = self.target_model(
+                    input_ids=combined_input_ids,
+                    attention_mask=basic_attention_mask,
+                    position_ids=combined_position_ids,
+                    tree_attention_mask=attn_mask,
+                    use_cache=False,
+                    output_attentions=False,
+                )
+            else:
+                # Try standard forward (won't have tree structure but at least runs)
+                print("Warning: Target model not wrapped with TreeMaskModelWrapper. Tree mask not applied.")
+                outputs = self.target_model(
+                    input_ids=combined_input_ids,
+                    attention_mask=basic_attention_mask,
+                    position_ids=combined_position_ids,
+                    use_cache=False,
+                )
+        
+        # 5) Extract logits for tree nodes
+        all_logits = outputs.logits[0, base_len-1:base_len-1+tree_size, :]  # [tree_size, vocab]
+        
+        # 6) Verify each path
         best_path_idx = -1
         max_accepted_length = 0
-        per_path_accepted = []
- 
-        for i, (path, valid_len) in enumerate(zip(paths, valid_lengths)):
-            path_logits = all_logits[i, :valid_len, :]
+        
+        for path_idx, path in enumerate(paths):
             accepted_length = 0
-            for j, draft_token in enumerate(path.token_ids):
-                target_token = torch.argmax(path_logits[j]).item()
-                if target_token == draft_token:
+            for depth, node in enumerate(path.nodes):
+                # Get flat index for this node
+                if node not in node_to_flat_idx:
+                    break
+                flat_idx = node_to_flat_idx[node]
+                
+                # Get target's greedy prediction at this position
+                node_logits = all_logits[flat_idx]
+                target_token = torch.argmax(node_logits).item()
+                
+                if target_token == node.token_id:
                     accepted_length += 1
                 else:
                     break
-            per_path_accepted.append(accepted_length)
+            
             if accepted_length > max_accepted_length:
                 max_accepted_length = accepted_length
-                best_path_idx = i
- 
+                best_path_idx = path_idx
+        
+        # 7) Return results
         if best_path_idx >= 0 and max_accepted_length > 0:
             best_path = paths[best_path_idx]
-            accepted_tokens = torch.tensor(best_path.token_ids[:max_accepted_length], device=draft_device)
+            accepted_tokens = torch.tensor(
+                best_path.token_ids[:max_accepted_length], 
+                device=draft_device
+            )
             acceptance_rate = max_accepted_length / len(best_path.token_ids)
         else:
-            best_path = None
             accepted_tokens = torch.tensor([], device=draft_device)
             acceptance_rate = 0.0
- 
-        # Update verified tokens and diagnostics
+        
+        # Update stats
         self.stats['total_verified_tokens'] += max_accepted_length
-        if getattr(self.config, 'profile', False):
-            diag_entry = {
-                'best_path_len': max_accepted_length,
-                'per_path_lengths': per_path_accepted,
-                'num_paths_verified': len(paths)
-            }
-            # Additional diagnostics: KL divergence and top-k overlap for first few positions on best path
-            try:
-                if best_path is not None and max_accepted_length > 0:
-                    # Use float32 for numerical stability
-                    target_logits_slice = all_logits[best_path_idx, :max_accepted_length, :].to(torch.float32)
-                    log_target_probs = F.log_softmax(target_logits_slice, dim=-1)
-                    target_probs = log_target_probs.exp()
-                    # If draft diagnostics exist, build draft distributions at these steps
-                    if getattr(best_path, 'draft_topk_tokens', None) and getattr(best_path, 'draft_topk_probs', None):
-                        kl_list = []
-                        overlap_list = []
-                        for step_idx in range(min(max_accepted_length, len(best_path.draft_topk_tokens))):
-                            draft_tokens = best_path.draft_topk_tokens[step_idx]
-                            draft_probs = best_path.draft_topk_probs[step_idx]
-                            if draft_tokens and draft_probs:
-                                vocab_size = target_probs.shape[-1]
-                                draft_dist = torch.full((vocab_size,), 1e-9, device=target_probs.device, dtype=torch.float32)
-                                for t_id, p in zip(draft_tokens, draft_probs):
-                                    if 0 <= t_id < vocab_size:
-                                        draft_dist[t_id] = max(float(p), 1e-9)
-                                draft_dist = draft_dist / draft_dist.sum()
-                                tgt_logp = log_target_probs[step_idx]
-                                # KL(draft || target) with log-probs
-                                kl_val = torch.sum(draft_dist * (torch.log(draft_dist) - tgt_logp)).item()
-                                kl_list.append(kl_val)
-                                # Top-k overlap
-                                k = min(10, vocab_size)
-                                tgt_topk = torch.topk(target_probs[step_idx], k).indices.tolist()
-                                overlap = len(set(draft_tokens[:k]).intersection(set(tgt_topk))) / float(k)
-                                overlap_list.append(overlap)
-                        if kl_list:
-                            diag_entry['avg_kl_draft_target'] = float(np.mean(kl_list))
-                        if overlap_list:
-                            diag_entry['avg_topk_overlap@10'] = float(np.mean(overlap_list))
-                # First-step metrics across all verified paths
-                first_step_mask = [vl > 0 for vl in valid_lengths]
-                if any(first_step_mask):
-                    logits_first = all_logits[[i for i, m in enumerate(first_step_mask) if m], 0, :].to(torch.float32)
-                    logp_first = F.log_softmax(logits_first, dim=-1)
-                    p_first = logp_first.exp()
-                    draft_first_tokens = [paths[i].token_ids[0] for i, m in enumerate(first_step_mask) if m]
-                    # Top1 match rate
-                    pred_first = torch.argmax(logits_first, dim=-1).tolist()
-                    top1_match = np.mean([int(t == d) for t, d in zip(pred_first, draft_first_tokens)])
-                    # Average rank and target prob of draft token
-                    ranks = []
-                    tgt_probs_of_draft = []
-                    overlaps = []
-                    tgt_top10 = torch.topk(p_first, k=min(10, p_first.shape[-1]), dim=-1).indices.tolist()
-                    for row_idx, d_tok in enumerate(draft_first_tokens):
-                        logits_row = logits_first[row_idx]
-                        # rank = 1 + number of logits >= draft logit
-                        rank = int((logits_row >= logits_row[d_tok]).sum().item())
-                        ranks.append(rank)
-                        tgt_probs_of_draft.append(float(p_first[row_idx, d_tok].item()))
-                        # overlap@10 with draft top-10 if available
-                        if getattr(paths[row_idx], 'draft_topk_tokens', None):
-                            draft_top10 = (paths[row_idx].draft_topk_tokens[0] or [])[:10]
-                            overlaps.append(len(set(draft_top10).intersection(set(tgt_top10[row_idx]))) / float(len(tgt_top10[row_idx])))
-                    diag_entry['first_step_top1_match_rate'] = float(top1_match)
-                    if ranks:
-                        diag_entry['first_step_avg_rank'] = float(np.mean(ranks))
-                    if tgt_probs_of_draft:
-                        diag_entry['first_step_avg_target_prob_of_draft'] = float(np.mean(tgt_probs_of_draft))
-                    if overlaps:
-                        diag_entry['first_step_avg_overlap@10'] = float(np.mean(overlaps))
-            except Exception:
-                pass
-            
-            self.stats['diagnostics'].append(diag_entry)
- 
+        
         return accepted_tokens, acceptance_rate
     
     def _generate_single_token(

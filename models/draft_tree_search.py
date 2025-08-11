@@ -113,6 +113,7 @@ class DraftTreeSearch:
         top_p: float = 0.9,
         device: str = "cuda",
         do_sample: bool = True,
+        max_paths_per_level: Optional[int] = None,
     ):
         self.draft_model = draft_model
         self.tokenizer = tokenizer
@@ -123,6 +124,7 @@ class DraftTreeSearch:
         self.top_p = top_p
         self.device = device
         self.do_sample = do_sample
+        self.max_paths_per_level = max_paths_per_level
         
         # Model is already loaded with device_map="auto" for multi-GPU
         self.draft_model.eval()
@@ -242,6 +244,12 @@ class DraftTreeSearch:
         for depth in range(self.max_depth):
             next_frontier = []
             
+            # Optional: cap frontier size per level
+            if hasattr(self, 'max_paths_per_level') and self.max_paths_per_level:
+                if len(frontier) > self.max_paths_per_level:
+                    # Keep highest score nodes
+                    frontier = sorted(frontier, key=lambda n: n.cumulative_score if n.cumulative_score is not None else 0.0, reverse=True)[: self.max_paths_per_level]
+            
             for parent_node in frontier:
                 # Get the current sequence
                 if parent_node.parent is None:  # Root node
@@ -341,7 +349,7 @@ class DraftTreeSearch:
             # Early stopping if no more candidates
             if not frontier:
                 break
-                
+            
         return all_paths
     
     def get_tree_statistics(self, tree_paths: List[TreePath]) -> Dict:

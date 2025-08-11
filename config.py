@@ -31,6 +31,7 @@ class TreeSearchConfig:
     temperature: float = 0.7  # Draft 모델의 sampling temperature
     top_k: int = 50  # Top-k sampling
     top_p: float = 0.9  # Nucleus sampling
+    max_paths_per_level: Optional[int] = 8  # 각 depth에서 유지할 최대 노드 수 (None이면 제한 없음)
     
 
 @dataclass
