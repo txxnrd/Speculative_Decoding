@@ -350,16 +350,22 @@ class SpeculativeDecoder:
         t0 = time.time()
         path_probs = []
         for path in tree_paths:
-            if path.hidden_states is not None:
-                # Move to alignment device for processing
-                hidden_states_device = path.hidden_states.to(self.primary_device)
-                aligned_states = self.affine_alignment(hidden_states_device.unsqueeze(0))
-                probs = self.acceptance_predictor(aligned_states).squeeze(0)
-                avg_prob = probs.mean().item()
-                path.acceptance_prob = avg_prob
-                path_probs.append(avg_prob)
+            # Use cumulative score as a simple heuristic instead of MLP prediction
+            # Normalize score to [0, 1] range
+            if len(tree_paths) > 1:
+                min_score = min(p.cumulative_score for p in tree_paths)
+                max_score = max(p.cumulative_score for p in tree_paths)
+                score_range = max_score - min_score
+                if score_range > 0:
+                    normalized_score = (path.cumulative_score - min_score) / score_range
+                else:
+                    normalized_score = 0.5
             else:
-                path_probs.append(0.0)
+                normalized_score = 0.5
+            
+            path.acceptance_prob = normalized_score
+            path_probs.append(normalized_score)
+            
         self.stats['timing']['prediction'] += time.time() - t0
         
         # 4. Tree pruning
