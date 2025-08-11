@@ -49,6 +49,8 @@ def main():
     # Pruning 설정 - 이제 학습된 MLP가 있으므로 활성화
     config.pruning.min_acceptance_prob = 0.1
     config.pruning.pruning_ratio = 0.5
+    config.pruning.top_k_paths = 4
+    config.profile = True
     
     # 2. Speculative Decoder 초기화
     print("Initializing Speculative Decoder...")

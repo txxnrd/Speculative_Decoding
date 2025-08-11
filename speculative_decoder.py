@@ -137,6 +137,7 @@ class SpeculativeDecoder:
         self.stats = {
             'total_draft_tokens': 0,
             'total_accepted_tokens': 0,
+            'total_verified_tokens': 0,  # sum of best path lengths (denominator for effective acceptance)
             'total_iterations': 0,
             'pruning_stats': [],
             'timing': {
@@ -145,7 +146,8 @@ class SpeculativeDecoder:
                 'prediction': 0,
                 'pruning': 0,
                 'verification': 0
-            }
+            },
+            'diagnostics': []
         }
         
     def load_pretrained_weights(self, checkpoint_path: str):
@@ -540,6 +542,7 @@ class SpeculativeDecoder:
         # Verify each path greedily
         best_path_idx = -1
         max_accepted_length = 0
+        per_path_accepted = []
 
         for i, (path, valid_len) in enumerate(zip(paths, valid_lengths)):
             path_logits = all_logits[i, :valid_len, :]
@@ -550,6 +553,7 @@ class SpeculativeDecoder:
                     accepted_length += 1
                 else:
                     break
+            per_path_accepted.append(accepted_length)
             if accepted_length > max_accepted_length:
                 max_accepted_length = accepted_length
                 best_path_idx = i
@@ -561,6 +565,15 @@ class SpeculativeDecoder:
         else:
             accepted_tokens = torch.tensor([], device=draft_device)
             acceptance_rate = 0.0
+
+        # Update verified tokens and diagnostics
+        self.stats['total_verified_tokens'] += max_accepted_length
+        if getattr(self.config, 'profile', False):
+            self.stats['diagnostics'].append({
+                'best_path_len': max_accepted_length,
+                'per_path_lengths': per_path_accepted,
+                'num_paths_verified': len(paths)
+            })
 
         return accepted_tokens, acceptance_rate
     
@@ -630,6 +643,10 @@ class SpeculativeDecoder:
                 self.stats['total_accepted_tokens'] / self.stats['total_draft_tokens']
                 if self.stats['total_draft_tokens'] > 0 else 0
             ),
+            'effective_acceptance_rate': (
+                self.stats['total_accepted_tokens'] / self.stats['total_verified_tokens']
+                if self.stats['total_verified_tokens'] > 0 else 0
+            ),
             'tokens_per_iteration': (
                 self.stats['total_accepted_tokens'] / self.stats['total_iterations']
                 if self.stats['total_iterations'] > 0 else 0
@@ -641,5 +658,17 @@ class SpeculativeDecoder:
         if self.stats['pruning_stats']:
             pruning_ratios = [s.pruning_ratio for s in self.stats['pruning_stats']]
             stats['average_pruning_ratio'] = np.mean(pruning_ratios)
-            
+        
+        # Diagnostics
+        if getattr(self.config, 'profile', False):
+            stats['diagnostics'] = self.stats.get('diagnostics', [])
+            stats['avg_best_path_len'] = (
+                float(np.mean([d['best_path_len'] for d in stats['diagnostics']]))
+                if stats['diagnostics'] else 0.0
+            )
+            stats['avg_num_paths_verified'] = (
+                float(np.mean([d['num_paths_verified'] for d in stats['diagnostics']]))
+                if stats['diagnostics'] else 0.0
+            )
+        
         return stats 
