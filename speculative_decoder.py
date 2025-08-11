@@ -45,13 +45,20 @@ class SpeculativeDecoder:
         self.config = config
         self.device = config.model.device
         
+        # Multi-GPU support: set primary device for alignment modules
+        if self.device == "cuda":
+            self.primary_device = "cuda:0"  # Alignment modules on first GPU
+        else:
+            self.primary_device = self.device
+        
         # Load models if not provided
         if draft_model is None:
             print(f"Loading draft model: {config.model.draft_model_name}")
             self.draft_model = AutoModelForCausalLM.from_pretrained(
                 config.model.draft_model_name,
                 torch_dtype=config.model.dtype,
-                device_map="auto"
+                device_map="auto",  # Automatic multi-GPU distribution
+                trust_remote_code=True
             )
         else:
             self.draft_model = draft_model
@@ -61,25 +68,27 @@ class SpeculativeDecoder:
             self.target_model = AutoModelForCausalLM.from_pretrained(
                 config.model.target_model_name,
                 torch_dtype=config.model.dtype,
-                device_map="auto"
+                device_map="auto",  # Automatic multi-GPU distribution
+                trust_remote_code=True
             )
         else:
             self.target_model = target_model
             
         if tokenizer is None:
             self.tokenizer = AutoTokenizer.from_pretrained(
-                config.model.draft_model_name
+                config.model.draft_model_name,
+                trust_remote_code=True
             )
         else:
             self.tokenizer = tokenizer
             
-        # Initialize components
+        # Initialize components on primary device
         self.affine_alignment = AffineAlignment(
             hidden_size_draft=config.affine_alignment.hidden_size_draft,
             hidden_size_target=config.affine_alignment.hidden_size_target,
             use_bias=config.affine_alignment.use_bias,
             dropout_rate=config.affine_alignment.dropout_rate
-        ).to(self.device)
+        ).to(self.primary_device)
         
         self.acceptance_predictor = AcceptanceProbabilityPredictor(
             input_dim=config.affine_alignment.hidden_size_target,
@@ -87,7 +96,7 @@ class SpeculativeDecoder:
             activation=config.mlp.activation,
             dropout_rate=config.mlp.dropout_rate,
             use_layer_norm=config.mlp.use_layer_norm
-        ).to(self.device)
+        ).to(self.primary_device)
         
         self.tree_search = DraftTreeSearch(
             draft_model=self.draft_model,
@@ -97,7 +106,7 @@ class SpeculativeDecoder:
             temperature=config.tree_search.temperature,
             top_k=config.tree_search.top_k,
             top_p=config.tree_search.top_p,
-            device=self.device
+            device=self.device  # Will handle multi-GPU internally
         )
         
         self.tree_pruner = TreePruner(
@@ -125,6 +134,18 @@ class SpeculativeDecoder:
             }
         }
         
+    def _get_model_device(self, model):
+        """Get the primary device of a model (for multi-GPU models)"""
+        try:
+            # For models with device_map
+            if hasattr(model, 'hf_device_map'):
+                # Get the device of the first layer
+                return next(iter(model.parameters())).device
+            else:
+                return next(iter(model.parameters())).device
+        except:
+            return torch.device(self.device)
+    
     @torch.no_grad()
     def generate(
         self,
@@ -159,6 +180,12 @@ class SpeculativeDecoder:
         if eos_token_id is None:
             eos_token_id = self.tokenizer.eos_token_id
             
+        # Move input to appropriate device for multi-GPU
+        draft_device = self._get_model_device(self.draft_model)
+        input_ids = input_ids.to(draft_device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(draft_device)
+            
         # Initialize
         generated_ids = input_ids.clone()
         cur_len = input_ids.shape[1]
@@ -186,7 +213,7 @@ class SpeculativeDecoder:
                     if attention_mask is not None:
                         attention_mask = torch.cat([
                             attention_mask,
-                            torch.ones(1, new_tokens.shape[1], device=self.device)
+                            torch.ones(1, new_tokens.shape[1], device=attention_mask.device)
                         ], dim=1)
                         
                     # Check for EOS
@@ -210,7 +237,7 @@ class SpeculativeDecoder:
                     if attention_mask is not None:
                         attention_mask = torch.cat([
                             attention_mask,
-                            torch.ones(1, 1, device=self.device)
+                            torch.ones(1, 1, device=attention_mask.device)
                         ], dim=1)
                         
                     if early_stopping and single_token.item() == eos_token_id:
@@ -250,21 +277,33 @@ class SpeculativeDecoder:
         step_stats['num_draft_paths'] = len(tree_paths)
         
         if not tree_paths:
-            return torch.tensor([], device=self.device), step_stats
+            draft_device = self._get_model_device(self.draft_model)
+            return torch.tensor([], device=draft_device), step_stats
             
-        # 2. Affine alignment
+        # 2. Affine alignment - handle device transfer
         t0 = time.time()
         for path in tree_paths:
             if path.hidden_states is not None:
-                aligned_states = self.affine_alignment(path.hidden_states.unsqueeze(0))
+                # Move hidden states to alignment device
+                hidden_states_aligned = path.hidden_states.to(self.primary_device)
+                aligned_states = self.affine_alignment(hidden_states_aligned.unsqueeze(0))
                 path.aligned_states = aligned_states
         self.stats['timing']['alignment'] += time.time() - t0
         
         # 3. Acceptance probability prediction
         t0 = time.time()
-        path_probs = self.acceptance_predictor.predict_path_probabilities(
-            tree_paths, self.affine_alignment
-        )
+        path_probs = []
+        for path in tree_paths:
+            if path.hidden_states is not None:
+                # Move to alignment device for processing
+                hidden_states_device = path.hidden_states.to(self.primary_device)
+                aligned_states = self.affine_alignment(hidden_states_device.unsqueeze(0))
+                probs = self.acceptance_predictor(aligned_states).squeeze(0)
+                avg_prob = probs.mean().item()
+                path.acceptance_prob = avg_prob
+                path_probs.append(avg_prob)
+            else:
+                path_probs.append(0.0)
         self.stats['timing']['prediction'] += time.time() - t0
         
         # 4. Tree pruning
@@ -281,7 +320,8 @@ class SpeculativeDecoder:
         step_stats['num_pruned_paths'] = len(pruned_paths)
         
         if not pruned_paths:
-            return torch.tensor([], device=self.device), step_stats
+            draft_device = self._get_model_device(self.draft_model)
+            return torch.tensor([], device=draft_device), step_stats
             
         # 5. Target model verification
         t0 = time.time()
@@ -321,22 +361,32 @@ class SpeculativeDecoder:
             accepted_tokens: 검증을 통과한 토큰 시퀀스
             acceptance_rate: 검증 통과 비율
         """
+        # Get target model device
+        target_device = self._get_model_device(self.target_model)
+        
         # Find the longest accepted sequence
         max_accepted_length = 0
         best_path = None
         
         for path in pruned_paths:
             # Construct full sequence for verification
+            draft_device = self._get_model_device(self.draft_model)
+            path_tokens = torch.tensor(path.token_ids, device=draft_device).unsqueeze(0)
+            
             candidate_ids = torch.cat([
-                input_ids,
-                torch.tensor(path.token_ids, device=self.device).unsqueeze(0)
+                input_ids.to(draft_device),
+                path_tokens
             ], dim=1)
+            
+            # Move to target device for verification
+            candidate_ids_target = candidate_ids.to(target_device)
+            attention_mask_target = attention_mask.to(target_device) if attention_mask is not None else None
             
             # Target model forward pass
             with torch.no_grad():
                 outputs = self.target_model(
-                    input_ids=candidate_ids[:, :-1],
-                    attention_mask=attention_mask,
+                    input_ids=candidate_ids_target[:, :-1],
+                    attention_mask=attention_mask_target,
                     use_cache=True
                 )
                 
@@ -363,15 +413,16 @@ class SpeculativeDecoder:
                 max_accepted_length = accepted_length
                 best_path = path
                 
-        # Return accepted tokens
+        # Return accepted tokens on draft device
+        draft_device = self._get_model_device(self.draft_model)
         if best_path and max_accepted_length > 0:
             accepted_tokens = torch.tensor(
                 best_path.token_ids[:max_accepted_length],
-                device=self.device
+                device=draft_device
             )
             acceptance_rate = max_accepted_length / len(best_path.token_ids)
         else:
-            accepted_tokens = torch.tensor([], device=self.device)
+            accepted_tokens = torch.tensor([], device=draft_device)
             acceptance_rate = 0.0
             
         return accepted_tokens, acceptance_rate
@@ -388,10 +439,15 @@ class SpeculativeDecoder:
         """
         타겟 모델로 단일 토큰 생성 (fallback)
         """
+        # Get target model device and move inputs
+        target_device = self._get_model_device(self.target_model)
+        input_ids_target = input_ids.to(target_device)
+        attention_mask_target = attention_mask.to(target_device) if attention_mask is not None else None
+        
         with torch.no_grad():
             outputs = self.target_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask
+                input_ids=input_ids_target,
+                attention_mask=attention_mask_target
             )
             
         logits = outputs.logits[0, -1, :]
@@ -423,7 +479,9 @@ class SpeculativeDecoder:
         else:
             next_token = torch.argmax(logits, keepdim=True)
             
-        return next_token.unsqueeze(0)
+        # Return on draft device for consistency
+        draft_device = self._get_model_device(self.draft_model)
+        return next_token.unsqueeze(0).to(draft_device)
     
     def _compute_generation_stats(self) -> Dict:
         """생성 통계 계산"""

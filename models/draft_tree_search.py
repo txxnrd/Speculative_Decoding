@@ -113,9 +113,15 @@ class DraftTreeSearch:
         self.top_p = top_p
         self.device = device
         
-        # Move model to device
-        self.draft_model.to(device)
+        # Model is already loaded with device_map="auto" for multi-GPU
         self.draft_model.eval()
+        
+    def _get_model_device(self):
+        """Get the primary device of the model"""
+        try:
+            return next(iter(self.draft_model.parameters())).device
+        except:
+            return torch.device(self.device)
         
     def _sample_top_k_top_p(
         self, 
@@ -189,6 +195,12 @@ class DraftTreeSearch:
         batch_size = input_ids.shape[0]
         assert batch_size == 1, "Currently only batch_size=1 is supported"
         
+        # Ensure input is on the right device
+        model_device = self._get_model_device()
+        input_ids = input_ids.to(model_device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(model_device)
+        
         # Initialize root node
         root = TreeNode(token_id=None, depth=-1)
         
@@ -222,7 +234,7 @@ class DraftTreeSearch:
                     token_sequence = parent_node.get_token_sequence()
                     current_input_ids = torch.tensor(
                         [token_sequence[-1]], 
-                        device=self.device
+                        device=model_device
                     ).unsqueeze(0)
                     current_past_key_values = parent_node.past_key_values
                     current_position = input_ids.shape[1] + len(token_sequence) - 1
@@ -261,9 +273,16 @@ class DraftTreeSearch:
                         token_ids = [node.token_id for node in path_nodes]
                         
                         if return_hidden_states:
-                            hidden_states = torch.stack([
-                                node.hidden_state for node in path_nodes
-                            ])
+                            # Collect hidden states and ensure they're on CPU to save GPU memory
+                            hidden_states_list = []
+                            for node in path_nodes:
+                                if node.hidden_state is not None:
+                                    hidden_states_list.append(node.hidden_state.cpu())
+                            
+                            if hidden_states_list:
+                                hidden_states = torch.stack(hidden_states_list)
+                            else:
+                                hidden_states = None
                         else:
                             hidden_states = None
                             
