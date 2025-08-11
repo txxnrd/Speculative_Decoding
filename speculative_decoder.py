@@ -411,7 +411,7 @@ class SpeculativeDecoder:
         # Pass the calculated acceptance probabilities to the pruner
         pruned_paths, pruning_stats = self.tree_pruner.prune_paths(
             tree_paths,
-            acceptance_probs=path_probs  # Pass the MLP predictions
+            path_probs  # Pass the MLP predictions as positional argument
         )
         self.stats['timing']['pruning'] += time.time() - t0
         
@@ -480,7 +480,7 @@ class SpeculativeDecoder:
         
         for path in paths:
             # Construct full sequence
-            path_tokens = torch.tensor(path.token_ids, device=draft_device)
+            path_tokens = torch.tensor(path.token_ids, device=draft_device).unsqueeze(0)  # Add batch dimension
             candidate_ids = torch.cat([input_ids.to(draft_device), path_tokens], dim=1)
             
             # Pad to max length
