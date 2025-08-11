@@ -22,6 +22,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 from collections import defaultdict
 import warnings
+import numpy as np
 
 # Import internal modules
 from config import SpeculativeDecodingConfig
