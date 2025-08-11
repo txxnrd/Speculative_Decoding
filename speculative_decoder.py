@@ -376,7 +376,11 @@ class SpeculativeDecoder:
                     token_probs = []
                     # aligned_states shape: [1, seq_len, hidden_size]
                     for token_idx in range(path.aligned_states.shape[1]):
-                        token_feat = path.aligned_states[0, token_idx].to(self.primary_device).float()  # [hidden_size]
+                        token_feat = path.aligned_states[0, token_idx].to(self.primary_device)
+                        # Ensure dtype matches MLP weights to avoid mismatch (e.g., float16 vs float32)
+                        target_dtype = self.acceptance_predictor.mlp[0].weight.dtype
+                        if token_feat.dtype != target_dtype:
+                            token_feat = token_feat.to(dtype=target_dtype)
                         prob_logit = self.acceptance_predictor(token_feat.unsqueeze(0))  # [1]
                         prob = torch.sigmoid(prob_logit).item()
                         token_probs.append(prob)
