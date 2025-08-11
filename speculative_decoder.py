@@ -117,7 +117,7 @@ class SpeculativeDecoder:
         
         # Load pre-trained weights if available
         if config.affine_alignment.alignment_checkpoint:
-            self.affine_alignment.load_weights(config.affine_alignment.alignment_checkpoint)
+            self.load_pretrained_weights(config.affine_alignment.alignment_checkpoint)
             
         # Statistics tracking
         self.stats = {
@@ -133,6 +133,59 @@ class SpeculativeDecoder:
                 'verification': 0
             }
         }
+        
+    def load_pretrained_weights(self, checkpoint_path: str):
+        """
+        Load pre-trained weights for affine alignment and acceptance predictor
+        
+        Args:
+            checkpoint_path: Path to the checkpoint file
+        """
+        print(f"Loading pre-trained weights from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        
+        # Load affine alignment weights
+        if 'W' in checkpoint and 'b' in checkpoint:
+            # Convert to appropriate dtype
+            W = checkpoint['W'].to(dtype=self.config.model.dtype)
+            b = checkpoint['b'].to(dtype=self.config.model.dtype)
+            
+            # Assign to affine alignment module
+            self.affine_alignment.weight.data = W
+            if self.affine_alignment.bias is not None:
+                self.affine_alignment.bias.data = b
+            print(f"✓ Loaded affine alignment weights: W={W.shape}, b={b.shape}")
+        
+        # Load MLP weights for acceptance predictor
+        if 'mlp' in checkpoint:
+            mlp_state_dict = checkpoint['mlp']
+            
+            # Map the loaded weights to our MLP structure
+            # The checkpoint has layers 0, 2, 4 (Linear layers)
+            our_state_dict = self.acceptance_predictor.state_dict()
+            
+            # Create mapping from checkpoint to our model
+            layer_mapping = {
+                '0.weight': 'mlp.0.weight',    # First linear layer
+                '0.bias': 'mlp.0.bias',
+                '2.weight': 'mlp.3.weight',    # Second linear layer (after LayerNorm, Activation, Dropout)
+                '2.bias': 'mlp.3.bias',
+                '4.weight': 'mlp.6.weight',    # Final linear layer
+                '4.bias': 'mlp.6.bias'
+            }
+            
+            # Update our state dict with loaded weights
+            for ckpt_key, our_key in layer_mapping.items():
+                if ckpt_key in mlp_state_dict and our_key in our_state_dict:
+                    # Convert to appropriate dtype
+                    weight = mlp_state_dict[ckpt_key].to(dtype=self.config.model.dtype)
+                    our_state_dict[our_key] = weight
+            
+            # Load the updated state dict
+            self.acceptance_predictor.load_state_dict(our_state_dict, strict=False)
+            print("✓ Loaded MLP weights for acceptance predictor")
+            
+        print("Pre-trained weights loaded successfully!")
         
     def _get_model_device(self, model):
         """Get the primary device of a model (for multi-GPU models)"""
