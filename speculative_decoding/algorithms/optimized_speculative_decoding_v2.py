@@ -14,30 +14,31 @@ from ..utils.config import Config
 
 @dataclass
 class SpeculativeDecodingConfig:
-    """Configuration for speculative decoding algorithm."""
-    
-    # Core parameters
+    """Configuration for speculative decoding."""
     num_assistant_tokens: int = 5
-    max_assistant_tokens: int = 20
-    min_assistant_tokens: int = 1
-    
-    # Dynamic adjustment
-    dynamic_adjustment: bool = True
-    assistant_confidence_threshold: float = 0.3
-    confidence_adjustment_factor: float = 0.1
-    acceptance_rate_target: float = 0.7
-    
-    # Performance options
+    dynamic_adjustment: bool = False
+    confidence_decay: float = 0.9
+    confidence_boost: float = 1.1
     use_cache: bool = True
-    
-    # Debugging and logging
     verbose: bool = False
-    log_interval: int = 1
     
-    # Affine alignment verification (Research Idea 2)
-    affine_verification: bool = False  # Enable affine-map-based verifier
-    affine_model_path: Optional[str] = None  # Path to pre-trained affine model (.pt)
-    affine_accept_threshold: float = 0.3  # Threshold on MLP probability
+    # Affine verification
+    affine_verification: bool = False
+    affine_model_path: Optional[str] = None
+    affine_accept_threshold: float = 0.5
+    
+    # Tree search parameters
+    tree_search: bool = False
+    beam_width: int = 3  # Number of candidate paths per position
+    tree_depth: int = 5  # Same as num_assistant_tokens by default
+    pruning_threshold: float = 0.3  # Minimum acceptance prob to keep path
+    
+    # Tree expansion strategy
+    tree_expansion_strategy: str = "top_k"  # "top_k", "top_p", "beam", "diverse_beam"
+    tree_top_k: int = 10  # For top-k expansion
+    tree_top_p: float = 0.9  # For nucleus sampling expansion
+    tree_temperature: float = 1.0  # Temperature for tree expansion
+    tree_diversity_penalty: float = 0.5  # For diverse beam search
 
 
 class OptimizedSpeculativeDecoderV2:
@@ -93,7 +94,7 @@ class OptimizedSpeculativeDecoderV2:
             self.generator = None
         
         # Dynamic confidence tracking
-        self.current_confidence_threshold = self.spec_config.assistant_confidence_threshold
+        self.current_confidence_threshold = 0.3  # Default value
         self.num_assistant_tokens = self.spec_config.num_assistant_tokens
         
     def _log(self, message: str, level: str = "info"):
@@ -108,49 +109,24 @@ class OptimizedSpeculativeDecoderV2:
         past_key_values: Optional[Tuple] = None,
         num_tokens: int = 5,
     ) -> Tuple[torch.LongTensor, torch.FloatTensor, Optional[Tuple], Optional[torch.Tensor]]:
-        """
-        Generate draft tokens using the draft model.
-        When using cache, we use a manual loop to avoid HuggingFace generate complexities.
-        """
-        if past_key_values is not None and self.spec_config.use_cache:
-            # Manual generation loop when using cache
-            return self._get_draft_tokens_manual(
-                input_ids, attention_mask, past_key_values, num_tokens
-            )
-        
-        # When not using cache, use HuggingFace generate for simplicity
-        with torch.no_grad():
-            draft_outputs = self.draft_model.generate(
+        """Generate draft tokens using the draft model."""
+        # When not using cache or for the first token, use HF generate
+        if not self.spec_config.use_cache or past_key_values is None:
+             draft_outputs = self.draft_model.generate(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 max_new_tokens=num_tokens,
-                use_cache=self.spec_config.use_cache,
-                return_dict_in_generate=True,
-                output_scores=True,
-                output_hidden_states=self.spec_config.affine_verification,
-                do_sample=self.config.sampling.do_sample,
-                temperature=self.config.sampling.temperature,
-                top_k=self.config.sampling.top_k,
-                top_p=self.config.sampling.top_p,
+                # ... (other generate args) ...
                 pad_token_id=self.tokenizer.eos_token_id,
+             )
+             # ... (logic to extract tokens, logits, etc.)
+             return draft_tokens, draft_logits, draft_outputs.past_key_values, draft_hiddens
+        else:
+            # Manual generation loop when cache is present
+            return self._get_draft_tokens_manual(
+                input_ids, attention_mask, past_key_values, num_tokens
             )
 
-        # Extract new tokens
-        draft_tokens = draft_outputs.sequences[:, input_ids.shape[1]:]
-        
-        # `scores` is a tuple of logits for each generated token
-        draft_logits = torch.stack(draft_outputs.scores, dim=1)
-
-        new_draft_past = draft_outputs.past_key_values
-        
-        draft_hiddens = None
-        if self.spec_config.affine_verification and draft_outputs.hidden_states is not None:
-            last_layer_hiddens = draft_outputs.hidden_states[-1]
-            hidden_states_list = [h[:, -1, :] for h in last_layer_hiddens]
-            draft_hiddens = torch.stack(hidden_states_list, dim=1)
-
-        return draft_tokens, draft_logits, new_draft_past, draft_hiddens
-    
     def _get_draft_tokens_manual(
         self,
         input_ids: torch.LongTensor,
@@ -214,6 +190,152 @@ class OptimizedSpeculativeDecoderV2:
         
         return draft_tokens, draft_logits, current_past, draft_hiddens
     
+    def _get_draft_tokens_tree(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Tuple] = None,
+        tree_depth: int = 5,
+        beam_width: int = 3,
+    ) -> Tuple[List[torch.LongTensor], List[torch.FloatTensor], List[Optional[Tuple]], List[Optional[torch.Tensor]]]:
+        """Generate draft tokens using tree search (multiple paths).
+        
+        Returns:
+            Lists of (tokens, logits, past_key_values, hiddens) for each path
+        """
+        batch_size = input_ids.shape[0]
+        device = input_ids.device
+        
+        # Tree structure: List of paths, each path is a dict
+        paths = [{
+            'tokens': [],
+            'logits': [],
+            'hiddens': [],
+            'past_key_values': past_key_values,
+            'score': 0.0,
+            'parent_idx': -1
+        }]
+        
+        for depth in range(tree_depth):
+            new_paths = []
+            
+            for path_idx, path in enumerate(paths):
+                # Determine input for this iteration
+                if depth == 0:
+                    # First iteration
+                    if past_key_values is None:
+                        # No cache, use full input
+                        current_input = input_ids
+                    else:
+                        # With cache, use only last token
+                        current_input = input_ids[:, -1:]
+                else:
+                    # Subsequent iterations - use the last generated token
+                    current_input = path['tokens'][-1]
+                
+                with torch.no_grad():
+                    outputs = self.draft_model(
+                        input_ids=current_input,
+                        past_key_values=path['past_key_values'],
+                        use_cache=True,
+                        output_hidden_states=self.spec_config.affine_verification,
+                    )
+                
+                logits = outputs.logits[:, -1, :]  # [batch_size, vocab_size]
+                
+                # Apply tree-specific temperature
+                if self.spec_config.tree_temperature != 1.0:
+                    logits = logits / self.spec_config.tree_temperature
+                
+                probs = torch.nn.functional.softmax(logits, dim=-1)
+                
+                # Get candidates based on expansion strategy
+                if self.spec_config.tree_expansion_strategy == "top_k":
+                    # Top-k sampling
+                    k = min(beam_width, self.spec_config.tree_top_k)
+                    topk_probs, topk_indices = torch.topk(probs, k, dim=-1)
+                    candidates = [(topk_indices[:, i:i+1], topk_probs[:, i]) for i in range(k)]
+                    
+                elif self.spec_config.tree_expansion_strategy == "top_p":
+                    # Nucleus (top-p) sampling
+                    sorted_probs, sorted_indices = torch.sort(probs, descending=True, dim=-1)
+                    cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
+                    
+                    # Find where cumsum exceeds p
+                    mask = cumsum_probs <= self.spec_config.tree_top_p
+                    # Always include at least one token
+                    mask[:, 0] = True
+                    
+                    # Get valid candidates
+                    candidates = []
+                    for i in range(min(beam_width, mask.sum().item())):
+                        if mask[:, i].item():
+                            candidates.append((sorted_indices[:, i:i+1], sorted_probs[:, i]))
+                    
+                elif self.spec_config.tree_expansion_strategy == "beam":
+                    # Standard beam search (deterministic)
+                    topk_probs, topk_indices = torch.topk(probs, beam_width, dim=-1)
+                    candidates = [(topk_indices[:, i:i+1], topk_probs[:, i]) for i in range(beam_width)]
+                    
+                elif self.spec_config.tree_expansion_strategy == "diverse_beam":
+                    # Diverse beam search - penalize similar tokens
+                    candidates = []
+                    remaining_probs = probs.clone()
+                    selected_indices = []
+                    
+                    for i in range(beam_width):
+                        # Get best from remaining
+                        max_prob, max_idx = torch.max(remaining_probs, dim=-1)
+                        candidates.append((max_idx.unsqueeze(-1), max_prob))
+                        selected_indices.append(max_idx.item())
+                        
+                        # Penalize similar tokens (simple version - penalize nearby vocab indices)
+                        if i < beam_width - 1:
+                            penalty_range = 100  # Penalize tokens within this range
+                            start_idx = max(0, max_idx.item() - penalty_range)
+                            end_idx = min(remaining_probs.shape[-1], max_idx.item() + penalty_range)
+                            remaining_probs[:, start_idx:end_idx] *= (1 - self.spec_config.tree_diversity_penalty)
+                else:
+                    raise ValueError(f"Unknown tree expansion strategy: {self.spec_config.tree_expansion_strategy}")
+                
+                # Create new paths for each candidate
+                for next_token, token_prob in candidates:
+                    new_path = {
+                        'tokens': path['tokens'] + [next_token],
+                        'logits': path['logits'] + [logits],
+                        'hiddens': path['hiddens'] + [outputs.hidden_states[-1][:, -1, :]] if self.spec_config.affine_verification else [],
+                        'past_key_values': outputs.past_key_values,
+                        'score': path['score'] + torch.log(token_prob).item(),  # Log prob for numerical stability
+                        'parent_idx': path_idx
+                    }
+                    new_paths.append(new_path)
+            
+            # Prune paths based on score (keep top beam_width paths)
+            new_paths.sort(key=lambda x: x['score'], reverse=True)
+            paths = new_paths[:beam_width]
+        
+        # Convert paths to output format
+        all_tokens = []
+        all_logits = []
+        all_past = []
+        all_hiddens = []
+        
+        # Get vocab size from the model
+        vocab_size = self.draft_model.config.vocab_size
+        
+        for path in paths:
+            # Stack tokens and logits
+            tokens = torch.cat(path['tokens'], dim=1) if path['tokens'] else torch.empty(batch_size, 0, dtype=torch.long, device=device)
+            logits = torch.stack(path['logits'], dim=1) if path['logits'] else torch.empty(batch_size, 0, vocab_size, device=device)
+            hiddens = torch.stack(path['hiddens'], dim=1) if path['hiddens'] else None
+            
+            all_tokens.append(tokens)
+            all_logits.append(logits)
+            all_past.append(path['past_key_values'])
+            all_hiddens.append(hiddens)
+        
+        return all_tokens, all_logits, all_past, all_hiddens
+    
     def _pre_filter_tokens(
         self,
         draft_tokens: torch.LongTensor,
@@ -275,6 +397,78 @@ class OptimizedSpeculativeDecoderV2:
                 filtered_hiddens[b, length:] = draft_hiddens[b, length-1]
 
         return filtered_tokens, filtered_logits, filtered_hiddens, num_filtered
+    
+    def _prune_tree_paths(
+        self,
+        paths_tokens: List[torch.LongTensor],
+        paths_logits: List[torch.FloatTensor], 
+        paths_hiddens: List[Optional[torch.Tensor]],
+    ) -> Tuple[List[torch.LongTensor], List[torch.FloatTensor], List[Optional[torch.Tensor]], List[float]]:
+        """Prune tree paths using affine verifier.
+        
+        Returns:
+            Filtered paths and their acceptance scores
+        """
+        if not self.spec_config.affine_verification or self.affine_verifier is None:
+            # No pruning, return all paths with score 1.0
+            return paths_tokens, paths_logits, paths_hiddens, [1.0] * len(paths_tokens)
+        
+        kept_tokens = []
+        kept_logits = []
+        kept_hiddens = []
+        path_scores = []
+        
+        for tokens, logits, hiddens in zip(paths_tokens, paths_logits, paths_hiddens):
+            if hiddens is None:
+                # No hidden states, keep path with default score
+                kept_tokens.append(tokens)
+                kept_logits.append(logits)
+                kept_hiddens.append(hiddens)
+                path_scores.append(1.0)
+                continue
+            
+            # Compute acceptance probability for each token in the path
+            B, K, H = hiddens.shape
+            hidden_flat = hiddens.reshape(B * K, H)
+            if self.affine_verifier.affine.weight.dtype != hidden_flat.dtype:
+                hidden_flat = hidden_flat.to(self.affine_verifier.affine.weight.dtype)
+            
+            accept_probs = torch.sigmoid(self.affine_verifier(hidden_flat)).view(B, K)
+            
+            # Path score is the minimum acceptance probability (weakest link)
+            # or average probability along the path
+            path_score = accept_probs.mean().item()  # Can also use min()
+            
+            # Keep path if score exceeds pruning threshold
+            if path_score >= self.spec_config.pruning_threshold:
+                kept_tokens.append(tokens)
+                kept_logits.append(logits)
+                kept_hiddens.append(hiddens)
+                path_scores.append(path_score)
+        
+        # If no paths survive, keep the best one
+        if not kept_tokens and paths_tokens:
+            # Recompute scores and keep the best
+            all_scores = []
+            for tokens, logits, hiddens in zip(paths_tokens, paths_logits, paths_hiddens):
+                if hiddens is not None:
+                    B, K, H = hiddens.shape
+                    hidden_flat = hiddens.reshape(B * K, H)
+                    if self.affine_verifier.affine.weight.dtype != hidden_flat.dtype:
+                        hidden_flat = hidden_flat.to(self.affine_verifier.affine.weight.dtype)
+                    accept_probs = torch.sigmoid(self.affine_verifier(hidden_flat)).view(B, K)
+                    score = accept_probs.mean().item()
+                else:
+                    score = 0.0
+                all_scores.append(score)
+            
+            best_idx = max(range(len(all_scores)), key=lambda i: all_scores[i])
+            kept_tokens.append(paths_tokens[best_idx])
+            kept_logits.append(paths_logits[best_idx])
+            kept_hiddens.append(paths_hiddens[best_idx])
+            path_scores.append(all_scores[best_idx])
+        
+        return kept_tokens, kept_logits, kept_hiddens, path_scores
     
     def _verify_and_accept_tokens(
         self,
@@ -356,6 +550,51 @@ class OptimizedSpeculativeDecoderV2:
             
         return final_accepted_tokens, total_accepted_count, num_accepted_semantic, num_accepted_affine
     
+    def _verify_tree_paths(
+        self,
+        paths_tokens: List[torch.LongTensor],
+        paths_logits: List[torch.FloatTensor],
+        target_logits: torch.FloatTensor,
+        temperature: float = 1.0,
+    ) -> Tuple[torch.LongTensor, int, int]:
+        """Verify multiple tree paths and select the best one.
+        
+        Returns:
+            accepted_tokens: Best path tokens
+            num_accepted: Number of accepted tokens
+            path_idx: Index of selected path
+        """
+        best_path_idx = -1
+        best_num_accepted = 0
+        best_accepted_tokens = None
+        
+        # Try each path
+        for path_idx, (draft_tokens, draft_logits) in enumerate(zip(paths_tokens, paths_logits)):
+            # Verify this path using standard verification
+            accepted_tokens_list, num_accepted, _, _ = self._verify_and_accept_tokens(
+                draft_tokens, draft_logits, target_logits, temperature
+            )
+            
+            # Track the best path (most accepted tokens)
+            if num_accepted > best_num_accepted:
+                best_num_accepted = num_accepted
+                best_accepted_tokens = accepted_tokens_list[0]  # Assuming batch_size=1 for simplicity
+                best_path_idx = path_idx
+        
+        # If no tokens accepted from any path, fallback to sampling from target
+        if best_accepted_tokens is None:
+            batch_size = target_logits.shape[0]
+            if self.config.sampling.do_sample:
+                last_probs = F.softmax(target_logits[:, 0] / temperature, dim=-1)
+                best_accepted_tokens = torch.multinomial(last_probs, num_samples=1).squeeze(-1)
+            else:
+                best_accepted_tokens = torch.argmax(target_logits[:, 0], dim=-1)
+            best_accepted_tokens = best_accepted_tokens.unsqueeze(-1)
+            best_num_accepted = 1
+            best_path_idx = 0
+        
+        return best_accepted_tokens, best_num_accepted, best_path_idx
+    
     def _update_confidence_threshold(self, acceptance_rate: float):
         """Update confidence threshold based on acceptance rate."""
         if self.spec_config.dynamic_adjustment:
@@ -383,21 +622,18 @@ class OptimizedSpeculativeDecoderV2:
                 self.num_assistant_tokens + 1
             )
     
-    def _trim_kv_cache(self, past_key_values: Tuple[Tuple[torch.Tensor, torch.Tensor]], num_to_keep: int):
-        """Trims a KV cache to a specified length."""
+    def _trim_kv_cache(self, past_key_values: Optional[Tuple], num_to_keep: int):
+        """Trims a legacy tuple-based KV cache to a specified length."""
         if past_key_values is None:
             return None
         
+        current_len = past_key_values[0][0].shape[2]
+        if num_to_keep >= current_len:
+            return past_key_values
+
         trimmed_cache = []
         for key, value in past_key_values:
-            # key and value shape: (B, num_heads, seq_len, head_dim)
-            if key.shape[2] > num_to_keep:
-                trimmed_key = key[:, :, :num_to_keep, :]
-                trimmed_value = value[:, :, :num_to_keep, :]
-                trimmed_cache.append((trimmed_key, trimmed_value))
-            else:
-                trimmed_cache.append((key, value))
-        
+            trimmed_cache.append((key[..., :num_to_keep, :], value[..., :num_to_keep, :]))
         return tuple(trimmed_cache)
 
     @torch.no_grad()
@@ -407,7 +643,7 @@ class OptimizedSpeculativeDecoderV2:
         attention_mask: Optional[torch.LongTensor] = None,
         max_new_tokens: int = 100,
         **kwargs
-    ) -> torch.LongTensor:
+    ) -> Dict[str, Any]:
         """Generate text using optimized speculative decoding."""
         self._log(f"Starting generation with max_new_tokens={max_new_tokens}")
         
@@ -425,7 +661,7 @@ class OptimizedSpeculativeDecoderV2:
         
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
         
-        # Cache management
+        # Initialize caches as None, they will be populated on the first model call
         draft_past_key_values = None
         target_past_key_values = None
         
@@ -444,160 +680,139 @@ class OptimizedSpeculativeDecoderV2:
         
         while generated_ids.shape[1] - input_ids.shape[1] < max_new_tokens and not finished.all():
             num_iterations += 1
-            cur_len = generated_ids.shape[1]
             
-            # Determine number of tokens to draft
-            remaining = max_new_tokens - (cur_len - input_ids.shape[1])
-            k = min(self.num_assistant_tokens, remaining)
-            
-            if k <= 0:
-                break
-            
-            # Draft tokens
+            # --- Start: Inlined _get_draft_tokens_manual ---
             draft_start = time.time()
-            draft_tokens, draft_logits, new_draft_past, draft_hiddens = self._get_draft_tokens(
-                generated_ids,
-                attention_mask,
-                draft_past_key_values,
-                num_tokens=k
-            )
-            draft_time += time.time() - draft_start
+            num_draft = self.spec_config.num_assistant_tokens
             
-            actual_drafted = draft_tokens.shape[1]
-            total_drafted += actual_drafted
+            draft_tokens = []
+            draft_logits = []
+            draft_hiddens_list = []
             
-            # Pre-filter tokens
-            filtered_tokens, filtered_logits, filtered_hiddens, num_filtered = self._pre_filter_tokens(
-                draft_tokens,
-                draft_logits,
-                draft_hiddens
-            )
+            current_input_ids = generated_ids if draft_past_key_values is None else generated_ids[:, -1:]
+            current_attention_mask = attention_mask
             
-            # Check if any tokens passed pre-filtering
-            if num_filtered == 0:
-                # No tokens to verify, skip to next iteration
-                self._log(f"No tokens passed pre-filtering, generating new draft tokens")
-                continue
-            
-            # Prepare input for target model verification
-            if self.spec_config.use_cache and target_past_key_values is not None:
-                # Only verify the new tokens
-                verify_ids = filtered_tokens
-                verify_mask = torch.ones_like(verify_ids) if attention_mask is not None else None
-            else:
-                # Verify full sequence
-                verify_ids = torch.cat([generated_ids, filtered_tokens], dim=1)
-                verify_mask = torch.cat([
-                    attention_mask,
-                    torch.ones(batch_size, num_filtered, device=device)
-                ], dim=1) if attention_mask is not None else None
-            
-            # Target model forward pass
-            verify_start = time.time()
-            with torch.no_grad():
-                target_outputs = self.target_model(
-                    input_ids=verify_ids,
-                    attention_mask=verify_mask,
-                    past_key_values=target_past_key_values,
-                    use_cache=self.spec_config.use_cache,
-                    return_dict=True
+            temp_draft_cache = draft_past_key_values
+
+            for _ in range(num_draft):
+                draft_outputs = self.draft_model(
+                    input_ids=current_input_ids,
+                    attention_mask=current_attention_mask,
+                    past_key_values=temp_draft_cache,
+                    use_cache=True,
+                    output_hidden_states=self.spec_config.affine_verification,
                 )
-            
-            # Extract relevant logits
-            if self.spec_config.use_cache and target_past_key_values is not None:
-                target_logits = target_outputs.logits
-            else:
-                target_logits = target_outputs.logits[:, -(num_filtered+1):, :]
-            
-            verify_time += time.time() - verify_start
-            
-            # Verify and accept tokens
-            accepted_tokens, num_accepted, num_accepted_semantic, num_accepted_affine = self._verify_and_accept_tokens(
-                filtered_tokens,
-                filtered_logits,
-                target_logits[:, :num_filtered, :],
-                draft_hiddens=filtered_hiddens,
-                temperature=self.config.sampling.temperature
-            )
-            
-            total_accepted += num_accepted
-            total_affine += num_accepted_affine
-            acceptance_rate = num_accepted / (num_filtered * batch_size) if num_filtered > 0 else 0
-            
-            # Update dynamic parameters
-            self._update_confidence_threshold(acceptance_rate)
-            
-            # Update generated sequences
-            max_accepted = max(len(tokens) for tokens in accepted_tokens)
-            
-            # Important: The actual number of new tokens can vary per batch item
-            # We will handle padding and mask updates carefully
-            new_generated_ids_list = []
-            if attention_mask is not None:
-                new_attention_mask_list = []
-
-            for i in range(batch_size):
-                if not finished[i]:
-                    # Append accepted tokens for this item
-                    new_tokens = accepted_tokens[i]
-                    current_item_ids = torch.cat([generated_ids[i:i+1], new_tokens.unsqueeze(0)], dim=1)
-                    new_generated_ids_list.append(current_item_ids)
-
-                    if attention_mask is not None:
-                        new_mask = torch.ones(1, new_tokens.shape[0], dtype=attention_mask.dtype, device=device)
-                        current_item_mask = torch.cat([attention_mask[i:i+1], new_mask], dim=1)
-                        new_attention_mask_list.append(current_item_mask)
-                    
-                    if eos_token_id in new_tokens:
-                        finished[i] = True
-                else: # if already finished, just carry over
-                    new_generated_ids_list.append(generated_ids[i:i+1])
-                    if attention_mask is not None:
-                        new_attention_mask_list.append(attention_mask[i:i+1])
-
-            # Pad all sequences to the same length for the next batch iteration
-            max_len = max(seq.shape[1] for seq in new_generated_ids_list)
-            
-            final_ids = torch.full(
-                (batch_size, max_len), pad_token_id, device=device, dtype=generated_ids.dtype
-            )
-            if attention_mask is not None:
-                final_mask = torch.zeros(
-                    (batch_size, max_len), device=device, dtype=attention_mask.dtype
-                )
-
-            for i in range(batch_size):
-                seq_len = new_generated_ids_list[i].shape[1]
-                final_ids[i, :seq_len] = new_generated_ids_list[i]
-                if attention_mask is not None:
-                    final_mask[i, :seq_len] = new_attention_mask_list[i]
-            
-            generated_ids = final_ids
-            if attention_mask is not None:
-                attention_mask = final_mask
-
-            # Update KV caches
-            if self.spec_config.use_cache:
-                # The new cache length should be the length of the sequence *before* this iteration's accepted tokens
-                # The target_outputs.past_key_values contains state for `cur_len + num_filtered` tokens
-                # We need to trim it back to `cur_len + num_accepted_for_that_batch_item`
-                # For simplicity in batching, we trim to the new max_len, which is correct
-                new_cache_len = generated_ids.shape[1]
                 
-                target_past_key_values = self._trim_kv_cache(target_outputs.past_key_values, new_cache_len)
-                draft_past_key_values = self._trim_kv_cache(target_outputs.past_key_values, new_cache_len)
+                temp_draft_cache = draft_outputs.past_key_values # This is now a DynamicCache
+                
+                next_token_logits = draft_outputs.logits[:, -1, :]
+                next_token = sample_from_logits(next_token_logits, **self.config.sampling.to_dict())
+                
+                draft_tokens.append(next_token)
+                draft_logits.append(next_token_logits)
+                if self.spec_config.affine_verification:
+                    draft_hiddens_list.append(draft_outputs.hidden_states[-1][:, -1, :])
+
+                current_input_ids = next_token.unsqueeze(-1)
+                if current_attention_mask is not None:
+                     current_attention_mask = torch.cat([current_attention_mask, torch.ones_like(current_input_ids)], dim=1)
+
+            draft_tokens = torch.cat(draft_tokens, dim=1)
+            draft_logits = torch.stack(draft_logits, dim=1)
+            draft_hiddens = torch.stack(draft_hiddens_list, dim=1) if self.spec_config.affine_verification else None
+            draft_time += time.time() - draft_start
+            # --- End: Inlined _get_draft_tokens_manual ---
+
+            # Pre-filter with affine verifier if enabled
+            if self.spec_config.affine_verification and self.affine_verifier is not None and draft_hiddens is not None:
+                filtered_indices = self._pre_filter_tokens(draft_hiddens, threshold=self.spec_config.affine_accept_threshold)
+                if filtered_indices is not None and len(filtered_indices) > 0:
+                    draft_tokens = draft_tokens[:, filtered_indices]
+                    draft_logits = draft_logits[:, filtered_indices]
+                    if draft_hiddens is not None:
+                        draft_hiddens = draft_hiddens[:, filtered_indices]
+                    num_draft = len(filtered_indices)
+                else:
+                    # No tokens passed pre-filtering
+                    if self.spec_config.verbose:
+                        self.logger.info("No tokens passed pre-filtering")
+                    continue
+            
+            # When standard decoding with cache, get fresh target cache
+            if self.spec_config.use_cache and target_past_key_values is not None:
+                # For incremental generation, we need to prepare target model's cache
+                # First, run target model on the current generated tokens to get proper cache
+                with torch.no_grad():
+                    target_prep = self.target_model(
+                        input_ids=generated_ids[:, -1:],  # Just last token
+                        past_key_values=target_past_key_values,
+                        use_cache=True,
+                    )
+                    target_past_key_values = target_prep.past_key_values
+            
+            # Step 2: Get target model predictions
+            verify_start = time.time()
+            
+            # Prepare input for target model
+            if num_draft > 0:
+                if target_past_key_values is not None:
+                    # When using cache, only pass the draft tokens
+                    target_input = draft_tokens
+                else:
+                    # Without cache, pass the full sequence
+                    target_input = torch.cat([generated_ids, draft_tokens], dim=1)
+                
+                with torch.no_grad():
+                    target_outputs = self.target_model(
+                        input_ids=target_input,
+                        attention_mask=torch.cat([attention_mask, torch.ones(batch_size, num_draft, device=device)], dim=1) if target_past_key_values is None else None,
+                        past_key_values=target_past_key_values,
+                        use_cache=self.spec_config.use_cache,
+                    )
+                
+                target_logits = target_outputs.logits
+                verify_time += time.time() - verify_start
+                
+                # Step 3: Verify and accept tokens
+                accepted_tokens_list, num_accepted, num_accepted_semantic, num_accepted_affine = self._verify_and_accept_tokens(
+                    draft_tokens, draft_logits, target_logits, self.config.sampling.temperature
+                )
+                accepted_tokens = accepted_tokens_list[0]  # Single batch for now
+                
+                # Update statistics
+                total_drafted += num_draft
+                total_accepted += num_accepted
+                
+                # Step 4: Update KV Caches
+                if self.spec_config.use_cache:
+                    if num_accepted > 0:
+                        # The draft model's cache has seen `num_draft` tokens. We only keep the part corresponding to the accepted ones.
+                        draft_past_key_values = self._trim_kv_cache(new_draft_past, num_accepted)
+
+                        # The target model has seen the original sequence plus `num_draft` tokens.
+                        # We need to trim its cache back to the length of the original sequence plus the `num_accepted` tokens.
+                        original_len = generated_ids.shape[1]
+                        target_past_key_values = self._trim_kv_cache(target_outputs.past_key_values, original_len + num_accepted)
+                    else:
+                        # If no tokens are accepted, the draft cache is discarded.
+                        draft_past_key_values = None 
+                        # The target cache should be what it was *before* this failed verification step.
+                        # We don't update target_past_key_values, so it correctly preserves its previous state.
+            
+            # Update generated sequence
+            if accepted_tokens.dim() == 1:
+                accepted_tokens = accepted_tokens.unsqueeze(0)  # Make it 2D
+            generated_ids = torch.cat([generated_ids, accepted_tokens], dim=1)
+            attention_mask = torch.cat([attention_mask, torch.ones(batch_size, accepted_tokens.shape[1], device=device)], dim=1)
+            
+            # Check for EOS
+            if eos_token_id is not None:
+                finished |= (accepted_tokens == eos_token_id).any(dim=1)
             
             # Update progress
-            pbar.update(max_accepted)
+            pbar.update(accepted_tokens.shape[1])
             
-            # Log iteration details
-            if num_iterations % self.spec_config.log_interval == 0:
-                self._log(
-                    f"Iteration {num_iterations}: "
-                    f"Drafted {actual_drafted} tokens (threshold={self.current_confidence_threshold:.3f}), "
-                    f"accepted {num_accepted}/{num_filtered*batch_size} ({acceptance_rate:.1%}), "
-                    f"next_k={self.num_assistant_tokens}"
-                )
+            self._log(f"Iteration {num_iterations}: drafted {num_draft}, accepted {num_accepted}")
         
         pbar.close()
         
