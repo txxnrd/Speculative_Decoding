@@ -88,6 +88,11 @@ def collect_training_data(
     target_model.eval()
     affine_alignment.eval()
     
+    # Get model devices for multi-GPU
+    draft_device = next(draft_model.parameters()).device
+    target_device = next(target_model.parameters()).device
+    affine_device = next(affine_alignment.parameters()).device
+    
     with torch.no_grad():
         for idx, item in enumerate(tqdm(dataset, total=num_samples, desc="Collecting data")):
             if idx >= num_samples:
@@ -100,21 +105,22 @@ def collect_training_data(
             
             # Tokenize
             inputs = tokenizer(full_text, return_tensors="pt", max_length=max_length, truncation=True)
-            input_ids = inputs['input_ids'].to(device)
+            input_ids_draft = inputs['input_ids'].to(draft_device)
+            input_ids_target = inputs['input_ids'].to(target_device)
             
-            if input_ids.shape[1] < 10:  # Skip too short sequences
+            if input_ids_draft.shape[1] < 10:  # Skip too short sequences
                 continue
             
             # Get draft model hidden states
-            draft_outputs = draft_model(input_ids, output_hidden_states=True)
+            draft_outputs = draft_model(input_ids_draft, output_hidden_states=True)
             draft_hidden_states = draft_outputs.hidden_states[-1]  # Last layer
             
             # Get target model outputs for comparison
-            target_outputs = target_model(input_ids)
+            target_outputs = target_model(input_ids_target)
             target_logits = target_outputs.logits
             
             # Process each position
-            for pos in range(1, input_ids.shape[1]):
+            for pos in range(1, min(input_ids_draft.shape[1], 50)):  # Limit positions per sample
                 # Draft model's prediction
                 draft_logit = draft_outputs.logits[0, pos-1]
                 draft_token = torch.argmax(draft_logit)
@@ -130,10 +136,12 @@ def collect_training_data(
                 
                 # Get aligned hidden state
                 draft_hidden = draft_hidden_states[0, pos-1].unsqueeze(0)
+                # Move to affine alignment device and ensure correct dtype
+                draft_hidden = draft_hidden.to(affine_device).to(torch.float16)
                 aligned_hidden = affine_alignment(draft_hidden.unsqueeze(0)).squeeze(0)
                 
                 training_data.append({
-                    'aligned_hidden_state': aligned_hidden.cpu().numpy().tolist(),
+                    'aligned_hidden_state': aligned_hidden.cpu().float().numpy().tolist(),  # Convert to float32 for storage
                     'accepted': int(accepted.item()),
                     'draft_token': draft_token.item(),
                     'target_prob': target_probs[draft_token].item()
@@ -247,7 +255,7 @@ def main():
     
     # Load affine alignment
     print("Loading affine alignment...")
-    affine_alignment = AffineAlignment(4096, 8192).to(device)
+    affine_alignment = AffineAlignment(4096, 8192).to(device).to(torch.float16)  # Match model dtype
     checkpoint = torch.load('affine_verifier_v4_regression.pt', map_location=device)
     affine_alignment.weight.data = checkpoint['W'].to(torch.float16)
     affine_alignment.bias.data = checkpoint['b'].to(torch.float16)
