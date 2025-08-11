@@ -24,6 +24,14 @@ from collections import defaultdict
 import warnings
 import numpy as np
 
+# Enable TF32 for speed where available
+try:
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+except Exception:
+    pass
+
 # Import internal modules
 from config import SpeculativeDecodingConfig
 from models import AffineAlignment, DraftTreeSearch, AcceptanceProbabilityPredictor, TreePruner
@@ -110,13 +118,15 @@ class SpeculativeDecoder:
             temperature=config.tree_search.temperature,
             top_k=config.tree_search.top_k,
             top_p=config.tree_search.top_p,
-            device=self.device  # Will handle multi-GPU internally
+            device=self.device,  # Will handle multi-GPU internally
+            do_sample=False
         )
         
         self.tree_pruner = TreePruner(
             min_acceptance_prob=config.pruning.min_acceptance_prob,
             adaptive_pruning=config.pruning.adaptive_pruning,
-            pruning_ratio=config.pruning.pruning_ratio
+            pruning_ratio=config.pruning.pruning_ratio,
+            top_k_paths=config.pruning.top_k_paths
         )
         
         # Load pre-trained weights if available
@@ -457,70 +467,100 @@ class SpeculativeDecoder:
         do_sample: bool = True
     ) -> Tuple[torch.Tensor, float]:
         """
-        타겟 모델로 드래프트 경로들을 병렬로 검증
-        
-        Returns:
-            accepted_tokens: 검증을 통과한 토큰들
-            acceptance_rate: 검증 통과 비율
+        타겟 모델로 드래프트 경로들을 배치로 한 번에 검증 (teacher forcing + greedy 비교)
         """
         if not paths:
             draft_device = self._get_model_device(self.draft_model)
             return torch.tensor([], device=draft_device), 0.0
-        
+
         target_device = self._get_model_device(self.target_model)
         draft_device = self._get_model_device(self.draft_model)
-        
-        # 1) Run base context once to get KV cache
+
+        # Cap number of paths to verify for speed
+        max_verify = 8
+        if len(paths) > max_verify:
+            paths = sorted(
+                paths,
+                key=lambda p: (
+                    p.acceptance_prob if p.acceptance_prob is not None else -1.0,
+                    p.cumulative_score,
+                ),
+                reverse=True,
+            )[:max_verify]
+
+        # Build batched sequences: base input + full path tokens (padded to max)
+        base_len = input_ids.shape[1]
+        max_path_len = max(len(p.token_ids) for p in paths)
+
+        batch_input_ids = []
+        batch_attention_mask = []
+        valid_lengths = []
+
+        pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+
+        for path in paths:
+            path_tokens = torch.tensor(path.token_ids, device=draft_device).unsqueeze(0)  # [1, L]
+            candidate_ids = torch.cat([input_ids.to(draft_device), path_tokens], dim=1)
+            path_len = len(path.token_ids)
+            padding_needed = max_path_len - path_len
+            if padding_needed > 0:
+                pad = torch.full((1, padding_needed), pad_token_id, device=draft_device)
+                candidate_ids = torch.cat([candidate_ids, pad], dim=1)
+            batch_input_ids.append(candidate_ids)
+            valid_lengths.append(path_len)
+
+            if attention_mask is not None:
+                path_attn = torch.cat([
+                    attention_mask.to(draft_device),
+                    torch.ones(1, path_len, device=draft_device),
+                    torch.zeros(1, padding_needed, device=draft_device),
+                ], dim=1)
+            else:
+                path_attn = torch.cat([
+                    torch.ones(1, base_len + path_len, device=draft_device),
+                    torch.zeros(1, padding_needed, device=draft_device),
+                ], dim=1)
+            batch_attention_mask.append(path_attn)
+
+        batch_input_ids = torch.cat(batch_input_ids, dim=0).to(target_device)  # [B, base+maxL]
+        batch_attention_mask = torch.cat(batch_attention_mask, dim=0).to(target_device)
+
+        # Teacher-forced forward for all paths at once (no cache for better throughput on long seq)
         with torch.no_grad():
-            base_outputs = self.target_model(
-                input_ids=input_ids.to(target_device),
-                attention_mask=(attention_mask.to(target_device) if attention_mask is not None else None),
-                use_cache=True
+            outputs = self.target_model(
+                input_ids=batch_input_ids[:, :-1],
+                attention_mask=batch_attention_mask[:, :-1],
+                use_cache=False,
             )
-        past_kv_base = base_outputs.past_key_values
-        
-        # 2) Verify each path greedily using the shared base KV cache
+
+        # Logits for positions where new tokens appear
+        all_logits = outputs.logits[:, base_len - 1 : base_len - 1 + max_path_len, :]
+
+        # Verify each path greedily
         best_path_idx = -1
         max_accepted_length = 0
-        
-        for i, path in enumerate(paths):
+
+        for i, (path, valid_len) in enumerate(zip(paths, valid_lengths)):
+            path_logits = all_logits[i, :valid_len, :]
             accepted_length = 0
-            past_kv = past_kv_base
-            
-            # Greedy verification is required for speculative decoding
-            for draft_token in path.token_ids:
-                token_tensor = torch.tensor([[draft_token]], device=target_device)
-                with torch.no_grad():
-                    out = self.target_model(
-                        input_ids=token_tensor,
-                        past_key_values=past_kv,
-                        use_cache=True
-                    )
-                logits = out.logits[0, -1, :]
-                target_token = torch.argmax(logits).item()
-                past_kv = out.past_key_values
-                
+            for j, draft_token in enumerate(path.token_ids):
+                target_token = torch.argmax(path_logits[j]).item()
                 if target_token == draft_token:
                     accepted_length += 1
                 else:
                     break
-            
             if accepted_length > max_accepted_length:
                 max_accepted_length = accepted_length
                 best_path_idx = i
-        
-        # 3) Return the best accepted prefix
+
         if best_path_idx >= 0 and max_accepted_length > 0:
             best_path = paths[best_path_idx]
-            accepted_tokens = torch.tensor(
-                best_path.token_ids[:max_accepted_length],
-                device=draft_device
-            )
+            accepted_tokens = torch.tensor(best_path.token_ids[:max_accepted_length], device=draft_device)
             acceptance_rate = max_accepted_length / len(best_path.token_ids)
         else:
             accepted_tokens = torch.tensor([], device=draft_device)
             acceptance_rate = 0.0
-        
+
         return accepted_tokens, acceptance_rate
     
     def _generate_single_token(

@@ -76,6 +76,7 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(decoder.device)
+    attention_mask = torch.ones_like(input_ids, device=decoder.device)
     
     print(f"\nPrompt: {prompt}")
     print("Generating text with speculative decoding...")
@@ -83,11 +84,12 @@ def main():
     # Generate
     generated_ids, stats = decoder.generate(
         input_ids=input_ids,
+        attention_mask=attention_mask,
         max_new_tokens=50,
-        temperature=0.8,
+        temperature=1.0,
         top_k=50,
-        top_p=0.9,
-        do_sample=True
+        top_p=1.0,
+        do_sample=False
     )
     
     # Decode output

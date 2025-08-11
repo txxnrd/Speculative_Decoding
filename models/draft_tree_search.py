@@ -102,7 +102,8 @@ class DraftTreeSearch:
         temperature: float = 0.7,
         top_k: int = 50,
         top_p: float = 0.9,
-        device: str = "cuda"
+        device: str = "cuda",
+        do_sample: bool = True,
     ):
         self.draft_model = draft_model
         self.tokenizer = tokenizer
@@ -112,6 +113,7 @@ class DraftTreeSearch:
         self.top_k = top_k
         self.top_p = top_p
         self.device = device
+        self.do_sample = do_sample
         
         # Model is already loaded with device_map="auto" for multi-GPU
         self.draft_model.eval()
@@ -131,10 +133,10 @@ class DraftTreeSearch:
         top_p: float
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Top-k, Top-p (nucleus) sampling
+        Top-k, Top-p (nucleus) sampling 또는 결정적 상위 후보 선택
         
         Returns:
-            sampled_indices: 샘플링된 토큰 인덱스들
+            sampled_indices: 샘플링/선택된 토큰 인덱스들
             sampled_logits: 해당 토큰들의 logit 값
         """
         # Apply temperature
@@ -143,6 +145,7 @@ class DraftTreeSearch:
         # Top-k filtering
         if top_k > 0:
             indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
+            logits = logits.clone()
             logits[indices_to_remove] = float('-inf')
             
         # Top-p filtering
@@ -150,7 +153,6 @@ class DraftTreeSearch:
             sorted_logits, sorted_indices = torch.sort(logits, descending=True)
             cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
             
-            # Remove tokens with cumulative probability above the threshold
             sorted_indices_to_remove = cumulative_probs > top_p
             sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
             sorted_indices_to_remove[..., 0] = 0
@@ -158,20 +160,27 @@ class DraftTreeSearch:
             indices_to_remove = sorted_indices_to_remove.scatter(
                 -1, sorted_indices, sorted_indices_to_remove
             )
+            logits = logits.clone()
             logits[indices_to_remove] = float('-inf')
             
-        # Sample from the filtered distribution
+        # Determine number of candidates
         probs = F.softmax(logits, dim=-1)
-        num_samples = min(self.max_candidates, (probs > 0).sum().item())
+        num_available = (probs > 0).sum().item()
+        num_samples = min(self.max_candidates, num_available) if num_available > 0 else 0
         
         if num_samples == 0:
-            # Fallback to argmax if no valid candidates
             sampled_indices = torch.argmax(logits, dim=-1, keepdim=True)
             sampled_logits = logits.gather(-1, sampled_indices)
-        else:
+            return sampled_indices, sampled_logits
+        
+        if self.do_sample:
             sampled_indices = torch.multinomial(probs, num_samples, replacement=False)
             sampled_logits = logits.gather(-1, sampled_indices)
-            
+        else:
+            topk = torch.topk(logits, k=num_samples, dim=-1)
+            sampled_indices = topk.indices
+            sampled_logits = topk.values
+        
         return sampled_indices, sampled_logits
     
     @torch.no_grad()
