@@ -614,7 +614,7 @@ class SpeculativeDecoder:
             
             # Set tree part of attention mask
             # Tree nodes can't see each other unless ancestor relationship
-            attn_mask[base_len:, base_len:] = ~ancestors.float()
+            attn_mask[base_len:, base_len:] = (~ancestors).float()
             
             # Tree nodes can see all base context (already 0)
             # Base context can't see tree nodes
