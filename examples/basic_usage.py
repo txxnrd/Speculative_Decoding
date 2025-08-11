@@ -109,6 +109,7 @@ def main():
     
     if 'average_pruning_ratio' in stats:
         print(f"Average pruning ratio: {stats['average_pruning_ratio']:.2%}")
+    print(f"Effective acceptance rate (vs verified tokens): {stats.get('effective_acceptance_rate', 0):.2%}")
     
     print("\n=== Timing Breakdown ===")
     total_time = sum(stats['timing'].values())
@@ -116,6 +117,14 @@ def main():
         percentage = (time_spent / total_time * 100) if total_time > 0 else 0
         print(f"{component}: {time_spent:.3f}s ({percentage:.1f}%)")
     print(f"Total: {total_time:.3f}s")
+    
+    # Diagnostics
+    if 'diagnostics' in stats:
+        print("\n=== Diagnostics (first 5 iterations) ===")
+        for i, d in enumerate(stats['diagnostics'][:5]):
+            print(f"iter {i}: best_len={d.get('best_path_len')}, num_paths={d.get('num_paths_verified')}, "
+                  f"avg_kl={d.get('avg_kl_draft_target', 'na')}, overlap@10={d.get('avg_topk_overlap@10', 'na')}")
+        print(f"avg_best_path_len={stats.get('avg_best_path_len', 0):.2f}, avg_num_paths_verified={stats.get('avg_num_paths_verified', 0):.2f}")
     
     # 5. 일반 생성과 비교 (옵션)
     print("\n\nComparing with standard generation...")

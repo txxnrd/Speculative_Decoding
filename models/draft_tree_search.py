@@ -31,6 +31,8 @@ class TreeNode:
         children: 자식 노드들
         depth: 트리에서의 깊이
         cumulative_score: 루트부터 현재 노드까지의 누적 점수
+        topk_tokens: (프로파일링) 이 위치에서의 draft 상위 K 토큰
+        topk_probs: (프로파일링) 상위 K 토큰 확률
     """
     
     def __init__(
@@ -39,7 +41,9 @@ class TreeNode:
         hidden_state: Optional[torch.Tensor] = None,
         logit: Optional[float] = None,
         parent: Optional['TreeNode'] = None,
-        depth: int = 0
+        depth: int = 0,
+        topk_tokens: Optional[List[int]] = None,
+        topk_probs: Optional[List[float]] = None,
     ):
         self.token_id = token_id
         self.hidden_state = hidden_state
@@ -48,6 +52,8 @@ class TreeNode:
         self.children: List['TreeNode'] = []
         self.depth = depth
         self.cumulative_score = 0.0
+        self.topk_tokens = topk_tokens
+        self.topk_probs = topk_probs
         
         if parent is not None:
             parent.children.append(self)
@@ -77,6 +83,9 @@ class TreePath:
     hidden_states: torch.Tensor  # [seq_len, hidden_size]
     cumulative_score: float
     acceptance_prob: Optional[float] = None  # Pruning을 위한 예측 확률
+    # Diagnostics (optional)
+    draft_topk_tokens: Optional[List[List[int]]] = None
+    draft_topk_probs: Optional[List[List[float]]] = None
 
 
 class DraftTreeSearch:
@@ -188,7 +197,8 @@ class DraftTreeSearch:
         self,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
-        return_hidden_states: bool = True
+        return_hidden_states: bool = True,
+        collect_diagnostics: bool = False,
     ) -> List[TreePath]:
         """
         Tree 구조로 draft 토큰들을 생성
@@ -264,6 +274,15 @@ class DraftTreeSearch:
                     logits, self.temperature, self.top_k, self.top_p
                 )
                 
+                # Diagnostics: compute draft top-k at this position if requested
+                diag_topk_tokens = None
+                diag_topk_probs = None
+                if collect_diagnostics:
+                    k_diag = 10
+                    topk_vals, topk_idx = torch.topk(F.softmax(logits, dim=-1), k=min(k_diag, logits.shape[-1]))
+                    diag_topk_tokens = topk_idx.tolist()
+                    diag_topk_probs = topk_vals.tolist()
+                
                 # Create child nodes
                 for idx, logit in zip(sampled_indices.tolist(), sampled_logits.tolist()):
                     child_node = TreeNode(
@@ -271,7 +290,9 @@ class DraftTreeSearch:
                         hidden_state=hidden_state,
                         logit=logit,
                         parent=parent_node,
-                        depth=depth
+                        depth=depth,
+                        topk_tokens=diag_topk_tokens,
+                        topk_probs=diag_topk_probs,
                     )
                     child_node.past_key_values = outputs.past_key_values
                     next_frontier.append(child_node)
@@ -294,12 +315,24 @@ class DraftTreeSearch:
                                 hidden_states = None
                         else:
                             hidden_states = None
-                            
+                        
+                        # Collect diagnostics along the path
+                        draft_topk_tokens = None
+                        draft_topk_probs = None
+                        if collect_diagnostics:
+                            draft_topk_tokens = []
+                            draft_topk_probs = []
+                            for node in path_nodes:
+                                draft_topk_tokens.append(node.topk_tokens or [])
+                                draft_topk_probs.append(node.topk_probs or [])
+                        
                         tree_path = TreePath(
                             nodes=path_nodes,
                             token_ids=token_ids,
                             hidden_states=hidden_states,
-                            cumulative_score=child_node.cumulative_score
+                            cumulative_score=child_node.cumulative_score,
+                            draft_topk_tokens=draft_topk_tokens,
+                            draft_topk_probs=draft_topk_probs,
                         )
                         all_paths.append(tree_path)
             

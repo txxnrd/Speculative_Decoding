@@ -361,7 +361,8 @@ class SpeculativeDecoder:
         tree_paths = self.tree_search.generate_tree(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            return_hidden_states=True
+            return_hidden_states=True,
+            collect_diagnostics=getattr(self.config, 'profile', False)
         )
         self.stats['timing']['draft_generation'] += time.time() - t0
         step_stats['num_draft_paths'] = len(tree_paths)
@@ -543,7 +544,7 @@ class SpeculativeDecoder:
         best_path_idx = -1
         max_accepted_length = 0
         per_path_accepted = []
-
+ 
         for i, (path, valid_len) in enumerate(zip(paths, valid_lengths)):
             path_logits = all_logits[i, :valid_len, :]
             accepted_length = 0
@@ -557,24 +558,63 @@ class SpeculativeDecoder:
             if accepted_length > max_accepted_length:
                 max_accepted_length = accepted_length
                 best_path_idx = i
-
+ 
         if best_path_idx >= 0 and max_accepted_length > 0:
             best_path = paths[best_path_idx]
             accepted_tokens = torch.tensor(best_path.token_ids[:max_accepted_length], device=draft_device)
             acceptance_rate = max_accepted_length / len(best_path.token_ids)
         else:
+            best_path = None
             accepted_tokens = torch.tensor([], device=draft_device)
             acceptance_rate = 0.0
-
+ 
         # Update verified tokens and diagnostics
         self.stats['total_verified_tokens'] += max_accepted_length
         if getattr(self.config, 'profile', False):
-            self.stats['diagnostics'].append({
+            diag_entry = {
                 'best_path_len': max_accepted_length,
                 'per_path_lengths': per_path_accepted,
                 'num_paths_verified': len(paths)
-            })
-
+            }
+            # Additional diagnostics: KL divergence and top-k overlap for first few positions on best path
+            try:
+                if best_path is not None and max_accepted_length > 0:
+                    # Extract target logits slice for best path
+                    target_logits_slice = all_logits[best_path_idx, :max_accepted_length, :]
+                    target_probs = F.softmax(target_logits_slice, dim=-1)
+                    # If draft diagnostics exist, build draft distributions at these steps
+                    if getattr(best_path, 'draft_topk_tokens', None) and getattr(best_path, 'draft_topk_probs', None):
+                        kl_list = []
+                        overlap_list = []
+                        for step_idx in range(min(max_accepted_length, len(best_path.draft_topk_tokens))):
+                            draft_tokens = best_path.draft_topk_tokens[step_idx]
+                            draft_probs = best_path.draft_topk_probs[step_idx]
+                            if draft_tokens and draft_probs:
+                                # Build sparse draft distribution vector
+                                vocab_size = target_probs.shape[-1]
+                                draft_dist = torch.full((vocab_size,), 1e-9, device=target_probs.device)
+                                for t_id, p in zip(draft_tokens, draft_probs):
+                                    if 0 <= t_id < vocab_size:
+                                        draft_dist[t_id] = max(float(p), 1e-9)
+                                draft_dist = draft_dist / draft_dist.sum()
+                                tgt_p = target_probs[step_idx]
+                                # KL(draft || target)
+                                kl_val = torch.sum(draft_dist * (torch.log(draft_dist) - torch.log(tgt_p + 1e-9))).item()
+                                kl_list.append(kl_val)
+                                # Top-k overlap
+                                k = min(10, vocab_size)
+                                tgt_topk = torch.topk(tgt_p, k).indices.tolist()
+                                overlap = len(set(draft_tokens[:k]).intersection(set(tgt_topk))) / float(k)
+                                overlap_list.append(overlap)
+                        if kl_list:
+                            diag_entry['avg_kl_draft_target'] = float(np.mean(kl_list))
+                        if overlap_list:
+                            diag_entry['avg_topk_overlap@10'] = float(np.mean(overlap_list))
+            except Exception:
+                pass
+            
+            self.stats['diagnostics'].append(diag_entry)
+ 
         return accepted_tokens, acceptance_rate
     
     def _generate_single_token(
