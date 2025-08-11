@@ -11,6 +11,8 @@ Affine Alignment based Speculative Decoder
 5. Token selection and generation
 """
 
+from __future__ import annotations
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -407,7 +409,7 @@ class SpeculativeDecoder:
         # 4. Tree pruning
         t0 = time.time()
         # Pass the calculated acceptance probabilities to the pruner
-        pruned_paths, pruning_stats = self.tree_pruner.prune(
+        pruned_paths, pruning_stats = self.tree_pruner.prune_paths(
             tree_paths,
             acceptance_probs=path_probs  # Pass the MLP predictions
         )
