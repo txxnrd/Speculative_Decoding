@@ -142,7 +142,7 @@ class SpeculativeDecoder:
             checkpoint_path: Path to the checkpoint file
         """
         print(f"Loading pre-trained weights from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         
         # Load affine alignment weights
         if 'W' in checkpoint and 'b' in checkpoint:
@@ -167,7 +167,7 @@ class SpeculativeDecoder:
             mlp_checkpoint_path: Path to the trained MLP checkpoint
         """
         print(f"Loading acceptance MLP from {mlp_checkpoint_path}")
-        mlp_checkpoint = torch.load(mlp_checkpoint_path, map_location='cpu')
+        mlp_checkpoint = torch.load(mlp_checkpoint_path, map_location='cpu', weights_only=False)
         
         if 'model_state_dict' in mlp_checkpoint:
             # Load the state dict
