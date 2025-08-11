@@ -49,7 +49,7 @@ class PruningConfig:
     min_acceptance_prob: float = 0.1  # 최소 acceptance probability threshold
     adaptive_pruning: bool = True  # 적응적 pruning 사용 여부
     pruning_ratio: float = 0.5  # 각 레벨에서 pruning할 경로 비율
-    top_k_paths: int | None = 4  # 검증에 넘길 최대 경로 수 (None이면 제한 없음)
+    top_k_paths: Optional[int] = 4  # 검증에 넘길 최대 경로 수 (None이면 제한 없음)
     
 
 @dataclass

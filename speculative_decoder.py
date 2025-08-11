@@ -284,6 +284,7 @@ class SpeculativeDecoder:
                 self.tree_search.temperature = temperature
                 self.tree_search.top_k = top_k  
                 self.tree_search.top_p = top_p
+                self.tree_search.do_sample = do_sample
                 
                 # Single iteration of speculative decoding
                 new_tokens, iter_stats = self._speculative_decode_step(
