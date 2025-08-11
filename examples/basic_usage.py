@@ -39,7 +39,7 @@ def main():
     config.affine_alignment.alignment_checkpoint = "/home/taeyun/Speculative_Decoding/affine_verifier_v4_regression.pt"
     
     # MLP 설정 (checkpoint와 일치하도록)
-    config.mlp.hidden_dims = [512, 128]  # checkpoint의 MLP 구조에 맞춤
+    config.mlp.hidden_dims = [256, 128]  # checkpoint의 실제 MLP 구조: 8192 -> 256 -> 128 -> 1
     
     # Tree search 파라미터
     config.tree_search.max_candidates = 3
