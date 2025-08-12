@@ -297,6 +297,10 @@ class SpeculativeDecoder:
                 self.tree_search.top_p = top_p
                 self.tree_search.do_sample = do_sample
                 
+                # Debug: ensure greedy for same model test
+                if getattr(self.config, 'profile', False) and self.stats['total_iterations'] < 3:
+                    print(f"\n[DEBUG] Tree search params: temp={temperature}, top_k={top_k}, top_p={top_p}, do_sample={do_sample}")
+                
                 # Single iteration of speculative decoding
                 new_tokens, iter_stats = self._speculative_decode_step(
                     generated_ids,
@@ -719,13 +723,25 @@ class SpeculativeDecoder:
                     )
         
         # 5) Extract logits for tree nodes
-        # For teacher-forced generation, logits at position i predict token i+1
-        # So for tree nodes starting at base_len, we need logits from base_len-1
-        all_logits = outputs.logits[0, base_len:base_len+tree_size, :]  # [tree_size, vocab]
+        # CRITICAL: Teacher-forcing means logits at position i predict token i+1
+        # The first tree token is predicted by logits at position base_len-1
+        all_logits = outputs.logits[0, base_len-1:base_len-1+tree_size, :]  # [tree_size, vocab]
+        
+        # Debug: check shapes and positions
+        if self.stats['total_iterations'] < 3 and getattr(self.config, 'profile', False):
+            print(f"\n[DEBUG] Logit extraction:")
+            print(f"  base_len={base_len}, tree_size={tree_size}")
+            print(f"  outputs.logits.shape={outputs.logits.shape}")
+            print(f"  all_logits.shape={all_logits.shape}")
+            print(f"  combined_input_ids.shape={combined_input_ids.shape}")
         
         # 6) Verify each path
         best_path_idx = -1
         max_accepted_length = 0
+        
+        # Debug: print first few verifications
+        if self.stats['total_iterations'] < 3 and getattr(self.config, 'profile', False):
+            print(f"\n[DEBUG Step {self.stats['total_iterations']}] Verification details:")
         
         for path_idx, path in enumerate(paths):
             accepted_length = 0
@@ -738,6 +754,15 @@ class SpeculativeDecoder:
                 # Get target's greedy prediction at this position
                 node_logits = all_logits[flat_idx]
                 target_token = torch.argmax(node_logits).item()
+                
+                # Debug output for first few paths/steps
+                if self.stats['total_iterations'] < 3 and path_idx < 2 and depth < 3 and getattr(self.config, 'profile', False):
+                    # Get top 5 predictions from target
+                    topk_values, topk_indices = torch.topk(node_logits, 5)
+                    topk_probs = F.softmax(topk_values, dim=-1)
+                    print(f"  Path {path_idx}, depth {depth}: draft_token={node.token_id}, target_token={target_token}")
+                    print(f"    Target top-5: {[(self.tokenizer.decode([t]), f'{p:.3f}') for t, p in zip(topk_indices.tolist(), topk_probs.tolist())]}")
+                    print(f"    Match: {target_token == node.token_id}")
                 
                 if target_token == node.token_id:
                     accepted_length += 1
