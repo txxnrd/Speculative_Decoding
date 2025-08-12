@@ -42,9 +42,9 @@ def main():
     # MLP 설정 (8B hidden size에 맞게 조정)
     config.mlp.hidden_dims = [256, 128]  # 4096 -> 256 -> 128 -> 1
     
-    # Tree search 파라미터 - 극도로 축소하여 테스트
-    config.tree_search.max_candidates = 1  # 단일 경로로 축소
-    config.tree_search.max_depth = 4      # 깊이는 늘려서 한 번에 더 많이
+    # Tree search 파라미터 - 속도 최적화 설정
+    config.tree_search.max_candidates = 2  # 작은 분기
+    config.tree_search.max_depth = 2      # 작은 깊이
     config.tree_search.temperature = 1.0   # greedy를 위해 온도 제거
     
     # Pruning 설정 - 더 공격적으로

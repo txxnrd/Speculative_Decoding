@@ -250,6 +250,9 @@ class DraftTreeSearch:
         past_key_values = outputs.past_key_values
         initial_hidden_state = outputs.hidden_states[-1][:, -1, :] if return_hidden_states else None
         
+        # Store initial past_key_values for reuse
+        base_past_key_values = past_key_values
+        
         # Tree expansion
         for depth in range(self.max_depth):
             next_frontier = []

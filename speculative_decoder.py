@@ -146,6 +146,12 @@ class SpeculativeDecoder:
         self.draft_model.eval()
         self.target_model.eval()
         
+        # Override generation config to ensure greedy decoding
+        if hasattr(self.draft_model, 'generation_config'):
+            self.draft_model.generation_config.do_sample = False
+            self.draft_model.generation_config.temperature = 1.0
+            self.draft_model.generation_config.top_p = 1.0
+        
         # Load pre-trained weights if available
         if config.affine_alignment.alignment_checkpoint:
             self.load_pretrained_weights(config.affine_alignment.alignment_checkpoint)
