@@ -388,6 +388,13 @@ class SpeculativeDecoder:
         self.stats['timing']['draft_generation'] += time.time() - t0
         step_stats['num_draft_paths'] = len(tree_paths)
         
+        # Debug: print generated paths
+        if self.stats['total_iterations'] < 3 and self.config.profile:
+            print(f"\n[DEBUG Step {self.stats['total_iterations']}] Generated {len(tree_paths)} paths:")
+            for i, path in enumerate(tree_paths[:3]):  # Print first 3 paths
+                tokens = [node.token_id for node in path.nodes]
+                print(f"  Path {i}: tokens={tokens}")
+        
         if not tree_paths:
             draft_device = self._get_model_device(self.draft_model)
             return torch.tensor([], device=draft_device), step_stats

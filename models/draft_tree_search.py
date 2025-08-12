@@ -191,6 +191,12 @@ class DraftTreeSearch:
             topk = torch.topk(logits, k=num_samples, dim=-1)
             sampled_indices = topk.indices
             sampled_logits = topk.values
+            
+            # Debug: print what we're selecting
+            if hasattr(self, '_debug_step') and self._debug_step < 3:
+                print(f"[DEBUG DraftTreeSearch] Selecting top-{num_samples} tokens:")
+                print(f"  sampled_indices: {sampled_indices}")
+                print(f"  sampled_logits: {sampled_logits}")
         
         return sampled_indices, sampled_logits
     
@@ -290,6 +296,14 @@ class DraftTreeSearch:
                     topk_vals, topk_idx = torch.topk(F.softmax(logits, dim=-1), k=min(k_diag, logits.shape[-1]))
                     diag_topk_tokens = topk_idx.tolist()
                     diag_topk_probs = topk_vals.tolist()
+                
+                # Debug: print what we're creating
+                if depth == 0 and not hasattr(self, '_printed_debug'):
+                    self._printed_debug = True
+                    print(f"\n[DEBUG] First level token selection:")
+                    print(f"  Top-5 from logits: {torch.topk(F.softmax(logits, dim=-1), 5)}")
+                    print(f"  sampled_indices: {sampled_indices}")
+                    print(f"  sampled_logits: {sampled_logits}")
                 
                 # Create child nodes
                 for idx, logit in zip(sampled_indices.tolist(), sampled_logits.tolist()):
