@@ -42,10 +42,10 @@ def main():
     # MLP 설정 (8B hidden size에 맞게 조정)
     config.mlp.hidden_dims = [256, 128]  # 4096 -> 256 -> 128 -> 1
     
-    # Tree search 파라미터 - 보수적으로 축소
-    config.tree_search.max_candidates = 2  # 3->2: 분기 수 감소
-    config.tree_search.max_depth = 2      # 4->2: 깊이 대폭 축소
-    config.tree_search.temperature = 0.1   # 매우 낮은 온도로 거의 greedy에 가깝게
+    # Tree search 파라미터 - 극도로 축소하여 테스트
+    config.tree_search.max_candidates = 1  # 단일 경로로 축소
+    config.tree_search.max_depth = 4      # 깊이는 늘려서 한 번에 더 많이
+    config.tree_search.temperature = 1.0   # greedy를 위해 온도 제거
     
     # Pruning 설정 - 더 공격적으로
     config.pruning.min_acceptance_prob = 0.3  # 0.1->0.3: 낮은 확률 경로 조기 제거
@@ -93,7 +93,7 @@ def main():
         temperature=1.0,
         top_k=50,
         top_p=1.0,
-        do_sample=True  # 트리 다양성을 위해 sampling 활성화
+        do_sample=False  # Greedy decoding for debugging
     )
     
     # Decode output
