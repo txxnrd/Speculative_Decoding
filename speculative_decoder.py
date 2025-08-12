@@ -83,16 +83,20 @@ class SpeculativeDecoder:
                 device_map="auto",  # Automatic multi-GPU distribution
                 trust_remote_code=True
             )
-            # Wrap with TreeMaskModelWrapper for 4D attention mask support
-            self.target_model = TreeMaskModelWrapper(base_model)
-            print("✓ Target model wrapped with TreeMaskModelWrapper for tree attention support")
+            # Wrap with TreeMaskModelWrapper for 4D attention mask support - DISABLED
+            # self.target_model = TreeMaskModelWrapper(base_model)
+            # print("✓ Target model wrapped with TreeMaskModelWrapper for tree attention support")
+            self.target_model = base_model
+            print("⚠ TreeMaskModelWrapper DISABLED for debugging")
         else:
-            # Wrap provided model if not already wrapped
-            if not isinstance(target_model, TreeMaskModelWrapper):
-                self.target_model = TreeMaskModelWrapper(target_model)
-                print("✓ Wrapped provided target model with TreeMaskModelWrapper")
-            else:
-                self.target_model = target_model
+            # Wrap provided model if not already wrapped - DISABLED
+            # if not isinstance(target_model, TreeMaskModelWrapper):
+            #     self.target_model = TreeMaskModelWrapper(target_model)
+            #     print("✓ Wrapped provided target model with TreeMaskModelWrapper")
+            # else:
+            #     self.target_model = target_model
+            self.target_model = target_model
+            print("⚠ TreeMaskModelWrapper DISABLED for debugging")
             
         if tokenizer is None:
             self.tokenizer = AutoTokenizer.from_pretrained(
@@ -137,6 +141,10 @@ class SpeculativeDecoder:
             pruning_ratio=config.pruning.pruning_ratio,
             top_k_paths=config.pruning.top_k_paths
         )
+        
+        # Ensure models are in eval mode to disable dropout
+        self.draft_model.eval()
+        self.target_model.eval()
         
         # Load pre-trained weights if available
         if config.affine_alignment.alignment_checkpoint:
@@ -690,37 +698,15 @@ class SpeculativeDecoder:
             
             # For models that support it, we can try to pass the 4D mask directly
             # Otherwise, we'll rely on the model to expand the 2D mask appropriately
-            use_tree_wrapper = isinstance(self.target_model, TreeMaskModelWrapper)
+            use_tree_wrapper = False  # isinstance(self.target_model, TreeMaskModelWrapper) - DISABLED
             
-            if use_tree_wrapper:
-                # Use our custom wrapper that supports tree masks
-                outputs = self.target_model(
-                    input_ids=combined_input_ids,
-                    attention_mask=basic_attention_mask,
-                    position_ids=combined_position_ids,
-                    tree_attention_mask=full_attn_mask,  # Use converted mask
-                    use_cache=False,
-                    output_attentions=False,
-                )
-            else:
-                # For standard models, we can try to pass attention_mask as 4D
-                # Some models like GPT2 accept this format
-                print("Warning: Target model not wrapped with TreeMaskModelWrapper. Attempting direct 4D mask.")
-                try:
-                    outputs = self.target_model(
-                        input_ids=combined_input_ids,
-                        attention_mask=full_attn_mask,  # Try 4D mask directly
-                        position_ids=combined_position_ids,
-                        use_cache=False,
-                    )
-                except Exception as e:
-                    print(f"4D mask failed ({e}), falling back to standard 2D mask (tree structure lost)")
-                    outputs = self.target_model(
-                        input_ids=combined_input_ids,
-                        attention_mask=basic_attention_mask,
-                        position_ids=combined_position_ids,
-                        use_cache=False,
-                    )
+            # Simple forward pass - no tree mask, just standard attention
+            outputs = self.target_model(
+                input_ids=combined_input_ids,
+                attention_mask=basic_attention_mask,
+                position_ids=combined_position_ids,
+                use_cache=False,
+            )
         
         # 5) Extract logits for tree nodes
         # CRITICAL: Teacher-forcing means logits at position i predict token i+1
