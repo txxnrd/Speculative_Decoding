@@ -27,13 +27,13 @@ def main():
     # 1. Configuration 설정
     config = SpeculativeDecodingConfig()
     
-    # 모델 설정 - 실제 로컬 Llama 모델 경로 사용
-    config.model.draft_model_name = "/hdd1/taeyun/Llama-3.1-8B-Instruct"
+    # 모델 설정 - 디버깅을 위해 draft와 target 모두 70B로 설정
+    config.model.draft_model_name = "/hdd1/taeyun/Llama-3.1-70B-Instruct"  # 8B -> 70B
     config.model.target_model_name = "/hdd1/taeyun/Llama-3.1-70B-Instruct"
     
-    # Hidden size 설정 (Llama 3.1 모델에 맞게)
-    config.affine_alignment.hidden_size_draft = 4096   # Llama 3.1 8B
-    config.affine_alignment.hidden_size_target = 8192  # Llama 3.1 70B
+    # Hidden size 설정 (둘 다 Llama 3.1 70B이므로 같은 크기)
+    config.affine_alignment.hidden_size_draft = 8192   # 70B hidden size
+    config.affine_alignment.hidden_size_target = 8192  # 70B hidden size
     
     # Load pre-trained alignment weights
     config.affine_alignment.alignment_checkpoint = "/home/taeyun/Speculative_Decoding/affine_verifier_v4_regression.pt"
