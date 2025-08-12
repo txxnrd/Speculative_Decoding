@@ -188,11 +188,13 @@ class DraftTreeSearch:
             sampled_indices = torch.multinomial(probs, num_samples, replacement=False)
             sampled_logits = logits.gather(-1, sampled_indices)
         else:
-            # For greedy decoding, select based on probabilities, not raw logits
+            # FIXED: For greedy decoding, select based on probabilities, not raw logits
+            print("[DEBUG] USING FIXED GREEDY SELECTION CODE")
             probs_for_selection = F.softmax(logits, dim=-1)
             topk_probs = torch.topk(probs_for_selection, k=num_samples, dim=-1)
             sampled_indices = topk_probs.indices
             sampled_logits = logits.gather(-1, sampled_indices)
+            print(f"[DEBUG] Selected indices from probs: {sampled_indices}")
             
             # Debug: print what we're selecting
             if hasattr(self, '_debug_step') and self._debug_step < 3:

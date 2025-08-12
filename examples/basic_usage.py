@@ -79,10 +79,14 @@ def main():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(decoder.device)
+    # Use the same tokenization as debug_models.py
+    inputs = tokenizer(prompt, return_tensors="pt")
+    input_ids = inputs["input_ids"].to(decoder.device)
     attention_mask = torch.ones_like(input_ids, device=decoder.device)
     
     print(f"\nPrompt: {prompt}")
+    print(f"Input IDs: {input_ids}")
+    print(f"Input tokens: {[tokenizer.decode([t]) for t in input_ids[0].tolist()]}")
     print("Generating text with speculative decoding...")
     
     # Generate
