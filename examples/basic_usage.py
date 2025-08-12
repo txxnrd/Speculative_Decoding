@@ -35,8 +35,9 @@ def main():
     config.affine_alignment.hidden_size_draft = 8192   # 70B hidden size
     config.affine_alignment.hidden_size_target = 8192  # 70B hidden size
     
-    # Load pre-trained alignment weights
-    config.affine_alignment.alignment_checkpoint = "/home/taeyun/Speculative_Decoding/affine_verifier_v4_regression.pt"
+    # Load pre-trained alignment weights - 비활성화 (draft와 target이 같은 크기이므로 불필요)
+    # config.affine_alignment.alignment_checkpoint = "/home/taeyun/Speculative_Decoding/affine_verifier_v4_regression.pt"
+    config.affine_alignment.alignment_checkpoint = None  # Identity mapping으로 충분
     
     # MLP 설정 (checkpoint와 일치하도록)
     config.mlp.hidden_dims = [256, 128]  # checkpoint의 실제 MLP 구조: 8192 -> 256 -> 128 -> 1
