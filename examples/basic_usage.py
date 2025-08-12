@@ -27,20 +27,20 @@ def main():
     # 1. Configuration 설정
     config = SpeculativeDecodingConfig()
     
-    # 모델 설정 - 디버깅을 위해 draft와 target 모두 70B로 설정
-    config.model.draft_model_name = "/hdd1/taeyun/Llama-3.1-70B-Instruct"  # 8B -> 70B
-    config.model.target_model_name = "/hdd1/taeyun/Llama-3.1-70B-Instruct"
+    # 모델 설정 - 디버깅을 위해 draft와 target 모두 8B로 설정
+    config.model.draft_model_name = "/hdd1/taeyun/Llama-3.1-8B-Instruct"
+    config.model.target_model_name = "/hdd1/taeyun/Llama-3.1-8B-Instruct"
     
-    # Hidden size 설정 (둘 다 Llama 3.1 70B이므로 같은 크기)
-    config.affine_alignment.hidden_size_draft = 8192   # 70B hidden size
-    config.affine_alignment.hidden_size_target = 8192  # 70B hidden size
+    # Hidden size 설정 (둘 다 Llama 3.1 8B이므로 같은 크기)
+    config.affine_alignment.hidden_size_draft = 4096   # 8B hidden size
+    config.affine_alignment.hidden_size_target = 4096  # 8B hidden size
     
     # Load pre-trained alignment weights - 비활성화 (draft와 target이 같은 크기이므로 불필요)
     # config.affine_alignment.alignment_checkpoint = "/home/taeyun/Speculative_Decoding/affine_verifier_v4_regression.pt"
     config.affine_alignment.alignment_checkpoint = None  # Identity mapping으로 충분
     
-    # MLP 설정 (checkpoint와 일치하도록)
-    config.mlp.hidden_dims = [256, 128]  # checkpoint의 실제 MLP 구조: 8192 -> 256 -> 128 -> 1
+    # MLP 설정 (8B hidden size에 맞게 조정)
+    config.mlp.hidden_dims = [256, 128]  # 4096 -> 256 -> 128 -> 1
     
     # Tree search 파라미터 - 보수적으로 축소
     config.tree_search.max_candidates = 2  # 3->2: 분기 수 감소
@@ -60,13 +60,14 @@ def main():
     
     decoder = SpeculativeDecoder(config)
     
-    # Load trained acceptance MLP
-    mlp_path = "/home/taeyun/Speculative_Decoding/best_acceptance_mlp.pt"
-    if os.path.exists(mlp_path):
-        decoder.load_acceptance_mlp(mlp_path)
-        print("✓ Loaded trained acceptance MLP")
-    else:
-        print("⚠ Warning: No trained acceptance MLP found, using random initialization")
+    # Load trained acceptance MLP - 비활성화 (디버깅 모드에서는 불필요)
+    # mlp_path = "/home/taeyun/Speculative_Decoding/best_acceptance_mlp.pt"
+    # if os.path.exists(mlp_path):
+    #     decoder.load_acceptance_mlp(mlp_path)
+    #     print("✓ Loaded trained acceptance MLP")
+    # else:
+    #     print("⚠ Warning: No trained acceptance MLP found, using random initialization")
+    print("⚠ Debug mode: Using random MLP initialization (draft=target model)")
     
     # 3. 텍스트 생성 예시
     prompt = "The future of artificial intelligence is"
