@@ -80,8 +80,13 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     
     # Use the same tokenization as debug_models.py
+    # First try without special tokens
     inputs = tokenizer(prompt, return_tensors="pt")
     input_ids = inputs["input_ids"].to(decoder.device)
+    
+    # Remove the <|begin_of_text|> token if present
+    if input_ids[0, 0] == 128000:  # <|begin_of_text|> token
+        input_ids = input_ids[:, 1:]  # Remove first token
     attention_mask = torch.ones_like(input_ids, device=decoder.device)
     
     print(f"\nPrompt: {prompt}")
