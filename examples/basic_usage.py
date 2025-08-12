@@ -45,7 +45,7 @@ def main():
     # Tree search 파라미터 - 보수적으로 축소
     config.tree_search.max_candidates = 2  # 3->2: 분기 수 감소
     config.tree_search.max_depth = 2      # 4->2: 깊이 대폭 축소
-    config.tree_search.temperature = 0.3   # 0.8->0.3: 더 확실한 토큰만 선택
+    config.tree_search.temperature = 0.1   # 매우 낮은 온도로 거의 greedy에 가깝게
     
     # Pruning 설정 - 더 공격적으로
     config.pruning.min_acceptance_prob = 0.3  # 0.1->0.3: 낮은 확률 경로 조기 제거
@@ -93,7 +93,7 @@ def main():
         temperature=1.0,
         top_k=50,
         top_p=1.0,
-        do_sample=False
+        do_sample=True  # 트리 다양성을 위해 sampling 활성화
     )
     
     # Decode output
